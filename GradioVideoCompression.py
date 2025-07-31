@@ -44,44 +44,57 @@ def create_interface():
         if not input_text or not input_text.strip():
             return []
         
+        # Clean input text
+        input_text = input_text.strip()
+        
         # First, try to split by newlines (original format)
-        lines = [line.strip() for line in input_text.strip().split('\n') if line.strip()]
+        lines = [line.strip() for line in input_text.split('\n') if line.strip()]
         
-        # If we only have one line, it might be space-separated paths
-        if len(lines) == 1:
-            # Check if it contains multiple paths by looking for common video extensions
-            single_line = lines[0]
-            video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.m4v', '.webm', '.flv', '.wmv']
+        # If we have multiple lines, return them as is
+        if len(lines) > 1:
+            return lines
+        
+        # If we only have one line, check if it contains multiple paths
+        single_line = lines[0]
+        video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.m4v', '.webm', '.flv', '.wmv']
+        
+        # Count potential file paths by looking for extensions
+        extension_count = sum(single_line.lower().count(ext) for ext in video_extensions)
+        
+        # If only one extension found, treat as single path
+        if extension_count <= 1:
+            return [single_line]
+        
+        # Multiple extensions found - try to parse space-separated paths
+        # Use shlex to properly handle quoted paths with spaces
+        import shlex
+        try:
+            paths = shlex.split(single_line)
+            # Filter to only include paths that look like video files
+            video_paths = [path for path in paths if any(path.lower().endswith(ext) for ext in video_extensions)]
+            return video_paths if video_paths else [single_line]
+        except ValueError:
+            # If shlex fails, fall back to simple space splitting
+            parts = single_line.split()
+            paths = []
+            current_path = ""
             
-            # Count potential file paths by looking for extensions
-            extension_count = sum(single_line.lower().count(ext) for ext in video_extensions)
-            
-            if extension_count > 1:
-                # This looks like space-separated paths
-                # Split by spaces but be careful about paths with spaces
-                parts = single_line.split()
-                paths = []
-                current_path = ""
-                
-                for part in parts:
-                    if current_path:
-                        current_path += " " + part
-                    else:
-                        current_path = part
-                    
-                    # Check if this looks like a complete path (ends with video extension)
-                    if any(current_path.lower().endswith(ext) for ext in video_extensions):
-                        paths.append(current_path)
-                        current_path = ""
-                
-                # Add any remaining path
+            for part in parts:
                 if current_path:
-                    paths.append(current_path)
+                    current_path += " " + part
+                else:
+                    current_path = part
                 
-                return paths
-        
-        # Return the line-separated format
-        return lines
+                # Check if this looks like a complete path (ends with video extension)
+                if any(current_path.lower().endswith(ext) for ext in video_extensions):
+                    paths.append(current_path)
+                    current_path = ""
+            
+            # Add any remaining path
+            if current_path:
+                paths.append(current_path)
+            
+            return paths if paths else [single_line]
     
     def process_videos_ui(file_paths_input, video_files, dry_run, 
                          target_bitrate_reduction, preserve_10bit, preserve_metadata,
@@ -115,13 +128,15 @@ def create_interface():
                 progress(0.1, desc="Parsing file paths...")
                 file_paths = parse_file_paths(file_paths_input)
                 
-                # Validate files exist
+                # Validate files exist and convert to strings
                 missing_files = []
                 for file_path in file_paths:
-                    if os.path.exists(file_path):
-                        files_to_process.append(file_path)
+                    # Ensure path is a string
+                    file_path_str = str(file_path).strip()
+                    if os.path.exists(file_path_str):
+                        files_to_process.append(file_path_str)
                     else:
-                        missing_files.append(file_path)
+                        missing_files.append(file_path_str)
                 
                 if missing_files:
                     return f"❌ Files not found:\n" + "\n".join(f"- {path}" for path in missing_files)
@@ -129,13 +144,14 @@ def create_interface():
             # Handle uploaded files
             elif video_files and len(video_files) > 0:
                 progress(0.1, desc="Processing uploaded files...")
-                files_to_process = [video_file.name for video_file in video_files]
+                # Ensure uploaded file paths are strings
+                files_to_process = [str(video_file.name) for video_file in video_files]
             
             if not files_to_process:
                 return "No files provided. Please upload files or provide file paths."
             
             # Process files with progress tracking
-            progress(0.2, desc=f"Starting processing of {len(files_to_process)} files...")
+            progress(0.1, desc=f"Analyzing {len(files_to_process)} files...")
             
             # Capture output
             output_lines = []
@@ -153,19 +169,15 @@ def create_interface():
             original_log = compressor.log
             compressor.log = ui_logger.log
             
+            # Create batch progress callback
+            def batch_progress_callback(overall_progress, status_message):
+                # Map overall progress to 0.2 -> 0.95 range (leaving some room for final steps)
+                mapped_progress = 0.2 + (overall_progress * 0.75)
+                progress(mapped_progress, desc=status_message)
+            
             try:
-                # Process each file
-                for i, file_path in enumerate(files_to_process):
-                    file_progress = 0.2 + (i * 0.7 / len(files_to_process))
-                    progress(file_progress, desc=f"Processing {Path(file_path).name} ({i+1}/{len(files_to_process)})")
-                    
-                    success, message = compressor.process_file(file_path, dry_run)
-                    
-                    if not success:
-                        output_lines.append(f"❌ FAILED: {Path(file_path).name} - {message}")
-                        break
-                    else:
-                        output_lines.append(f"✅ SUCCESS: {Path(file_path).name}")
+                # Process all files using batch processing with progress
+                compressor.process_file_list(files_to_process, dry_run, batch_progress_callback)
                 
                 progress(1.0, desc="Processing complete!")
                 
@@ -375,7 +387,7 @@ def main():
     interface = create_interface()
     interface.launch(
         server_name="0.0.0.0",
-        server_port=7869,
+        server_port=7862,
         share=False,
         show_error=True
     )

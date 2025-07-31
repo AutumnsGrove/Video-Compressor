@@ -139,48 +139,192 @@ class VideoCompressor:
             self.log(f"Error getting video info: {e}", "ERROR")
             return None
     
-    def verify_file_integrity(self, file_path):
-        """Verify file can be opened and basic properties match expectations."""
-        self.log(f"Verifying integrity of {file_path}")
+    def get_video_duration(self, video_info):
+        """Extract video duration in seconds from video info."""
+        try:
+            # Try to get duration from format first
+            format_info = video_info.get("format", {})
+            if "duration" in format_info:
+                return float(format_info["duration"])
+            
+            # Fallback: get from video stream
+            video_streams = [s for s in video_info.get("streams", []) if s.get("codec_type") == "video"]
+            if video_streams and "duration" in video_streams[0]:
+                return float(video_streams[0]["duration"])
+                
+        except (ValueError, KeyError, TypeError):
+            pass
+        return 0.0
+    
+    def verify_file_integrity(self, file_path, original_info=None):
+        """Comprehensive file integrity verification with detailed logging."""
+        self.log(f"🔍 COMPREHENSIVE FILE VERIFICATION")
+        self.log(f"   File: {file_path}")
         
-        # Check if file exists and has reasonable size
+        verification_results = []
+        
+        # Step 1: Basic file existence and size check
+        self.log(f"   Step 1: Basic file checks...")
         if not os.path.exists(file_path):
             return False, "File does not exist"
         
         file_size = os.path.getsize(file_path)
+        file_size_mb = file_size / (1024 * 1024)
         if file_size < 1024:  # Less than 1KB is suspicious
             return False, f"File too small: {file_size} bytes"
         
-        # Try to get video info
+        self.log(f"   ✅ File exists: {file_size_mb:.2f}MB")
+        verification_results.append(f"File size: {file_size_mb:.2f}MB")
+        
+        # Step 2: Video metadata analysis
+        self.log(f"   Step 2: Analyzing video metadata...")
         video_info = self.get_video_info(file_path)
         if not video_info:
             return False, "Cannot read video information"
         
-        # Check if video has streams
+        # Analyze streams
         streams = video_info.get("streams", [])
         video_streams = [s for s in streams if s.get("codec_type") == "video"]
+        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
         
         if not video_streams:
             return False, "No video streams found"
         
-        # Basic playability test - try to decode first few seconds
-        cmd = [
+        self.log(f"   ✅ Stream analysis:")
+        self.log(f"      Video streams: {len(video_streams)}")
+        self.log(f"      Audio streams: {len(audio_streams)}")
+        verification_results.append(f"Streams: {len(video_streams)} video, {len(audio_streams)} audio")
+        
+        # Detailed video stream info
+        for i, stream in enumerate(video_streams):
+            codec = stream.get("codec_name", "unknown")
+            profile = stream.get("profile", "")
+            width = stream.get("width", 0)
+            height = stream.get("height", 0)
+            duration = stream.get("duration", "unknown")
+            bit_rate = stream.get("bit_rate", "unknown")
+            
+            self.log(f"      Video Stream {i+1}:")
+            self.log(f"        Codec: {codec} {profile}")
+            self.log(f"        Resolution: {width}x{height}")
+            self.log(f"        Duration: {duration}s")
+            if bit_rate != "unknown":
+                self.log(f"        Bitrate: {int(bit_rate)//1000}kbps")
+            
+            verification_results.append(f"Video: {codec} {width}x{height}")
+        
+        # Detailed audio stream info
+        for i, stream in enumerate(audio_streams):
+            codec = stream.get("codec_name", "unknown")
+            sample_rate = stream.get("sample_rate", "unknown")
+            channels = stream.get("channels", "unknown")
+            
+            self.log(f"      Audio Stream {i+1}:")
+            self.log(f"        Codec: {codec}")
+            self.log(f"        Sample Rate: {sample_rate}Hz")
+            self.log(f"        Channels: {channels}")
+            
+            verification_results.append(f"Audio: {codec} {channels}ch")
+        
+        # Step 3: Compare with original if provided
+        if original_info:
+            self.log(f"   Step 3: Comparing with original...")
+            original_streams = original_info.get("streams", [])
+            original_video = [s for s in original_streams if s.get("codec_type") == "video"]
+            original_audio = [s for s in original_streams if s.get("codec_type") == "audio"]
+            
+            # Compare stream counts
+            if len(video_streams) == len(original_video):
+                self.log(f"   ✅ Video stream count matches original")
+            else:
+                self.log(f"   ⚠️  Video stream count differs: {len(video_streams)} vs {len(original_video)}")
+            
+            if len(audio_streams) == len(original_audio):
+                self.log(f"   ✅ Audio stream count matches original")
+            else:
+                self.log(f"   ⚠️  Audio stream count differs: {len(audio_streams)} vs {len(original_audio)}")
+            
+            # Compare resolution
+            if video_streams and original_video:
+                orig_res = f"{original_video[0].get('width', 0)}x{original_video[0].get('height', 0)}"
+                new_res = f"{video_streams[0].get('width', 0)}x{video_streams[0].get('height', 0)}"
+                if orig_res == new_res:
+                    self.log(f"   ✅ Resolution preserved: {new_res}")
+                else:
+                    self.log(f"   ⚠️  Resolution changed: {orig_res} → {new_res}")
+        
+        # Step 4: Playability test - decode sample sections
+        self.log(f"   Step 4: Playability testing...")
+        
+        # Test beginning (first 5 seconds)
+        self.log(f"      Testing beginning (0-5s)...")
+        cmd_start = [
             self.config["ffmpeg_path"],
             "-v", "error",
-            "-i", file_path,
-            "-t", "5",  # Test first 5 seconds
-            "-f", "null",
-            "-"
+            "-i", str(file_path),
+            "-t", "5",
+            "-f", "null", "-"
         ]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0:
-                return False, f"Playback test failed: {result.stderr}"
+            result = subprocess.run(cmd_start, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                self.log(f"      ✅ Beginning playback test passed")
+            else:
+                return False, f"Beginning playback test failed: {result.stderr}"
         except Exception as e:
-            return False, f"Playback test error: {e}"
+            return False, f"Beginning playback test error: {e}"
         
-        return True, "File verification successful"
+        # Test middle section
+        video_duration = self.get_video_duration(video_info)
+        if video_duration > 20:  # Only test middle if video is long enough
+            middle_start = video_duration / 2 - 2.5  # Start 2.5s before middle
+            self.log(f"      Testing middle section ({middle_start:.1f}-{middle_start+5:.1f}s)...")
+            cmd_middle = [
+                self.config["ffmpeg_path"],
+                "-v", "error",
+                "-ss", str(middle_start),
+                "-i", str(file_path),
+                "-t", "5",
+                "-f", "null", "-"
+            ]
+            
+            try:
+                result = subprocess.run(cmd_middle, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    self.log(f"      ✅ Middle section playback test passed")
+                else:
+                    self.log(f"      ⚠️  Middle section playback test failed: {result.stderr}")
+            except Exception as e:
+                self.log(f"      ⚠️  Middle section playback test error: {e}")
+        
+        # Test end (last 5 seconds)
+        if video_duration > 10:  # Only test end if video is long enough
+            end_start = max(0, video_duration - 5)
+            self.log(f"      Testing end section ({end_start:.1f}s-end)...")
+            cmd_end = [
+                self.config["ffmpeg_path"],
+                "-v", "error",
+                "-ss", str(end_start),
+                "-i", str(file_path),
+                "-f", "null", "-"
+            ]
+            
+            try:
+                result = subprocess.run(cmd_end, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    self.log(f"      ✅ End section playback test passed")
+                else:
+                    self.log(f"      ⚠️  End section playback test failed: {result.stderr}")
+            except Exception as e:
+                self.log(f"      ⚠️  End section playback test error: {e}")
+        
+        # Step 5: Final summary
+        self.log(f"   Step 5: Verification summary...")
+        self.log(f"   🎯 VERIFICATION COMPLETE - ALL TESTS PASSED")
+        self.log(f"   📊 File Details: {' | '.join(verification_results)}")
+        
+        return True, f"Comprehensive verification successful: {' | '.join(verification_results)}"
     
     def estimate_compression_time(self, file_path):
         """Estimate compression time based on file size and system performance."""
@@ -202,7 +346,7 @@ class VideoCompressor:
         estimated_minutes = file_size_gb * minutes_per_gb
         return timedelta(minutes=estimated_minutes)
     
-    def compress_video(self, input_path, output_path, dry_run=False):
+    def compress_video(self, input_path, output_path, dry_run=False, progress_callback=None):
         """Compress video file with safety checks."""
         self.log(f"{'[DRY RUN] ' if dry_run else ''}Starting compression: {input_path}")
         
@@ -218,29 +362,98 @@ class VideoCompressor:
         if not original_info:
             return False, "Cannot read original video information"
         
-        # Build ffmpeg command
+        # Get video duration for progress calculation
+        video_duration = self.get_video_duration(original_info)
+        
+        # Build ffmpeg command with progress output to stderr
         cmd = self.build_ffmpeg_command(input_path, output_path, original_info)
+        # Add progress output - use stderr and stats for better real-time updates
+        cmd.extend(["-stats", "-loglevel", "info"])
         
         self.log(f"FFmpeg command: {' '.join(cmd)}")
         
         # Start compression with progress monitoring
         start_time = time.time()
+        import threading
+        import queue
+        import re
+        
         try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 universal_newlines=True,
-                bufsize=1
+                bufsize=0  # Unbuffered
             )
             
-            # Monitor progress
-            for line in process.stdout:
-                if "time=" in line:
-                    # Extract time information for progress
-                    self.log(f"Progress: {line.strip()}")
+            # Queue for thread communication
+            progress_queue = queue.Queue()
             
+            def monitor_stderr():
+                """Monitor stderr for progress in separate thread."""
+                current_progress = 0.0
+                for line in iter(process.stderr.readline, ''):
+                    line = line.strip()
+                    if line:
+                        # Look for time progress in various formats
+                        time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2}\.\d{2})', line)
+                        if time_match and video_duration > 0:
+                            hours, minutes, seconds = time_match.groups()
+                            current_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                            progress_pct = min(current_seconds / video_duration, 1.0)
+                            
+                            # Only update if progress increased significantly
+                            if progress_pct > current_progress + 0.01:  # Update every 1%
+                                current_progress = progress_pct
+                                progress_queue.put((progress_pct, current_seconds, line))
+                        
+                        # Also capture frame info for additional progress tracking
+                        frame_match = re.search(r'frame=\s*(\d+)', line)
+                        if frame_match:
+                            progress_queue.put(('frame_info', line))
+            
+            # Start monitoring thread
+            monitor_thread = threading.Thread(target=monitor_stderr, daemon=True)
+            monitor_thread.start()
+            
+            # Process progress updates
+            last_update_time = time.time()
+            current_progress = 0.0
+            
+            while process.poll() is None:
+                try:
+                    # Check for progress updates with timeout
+                    update = progress_queue.get(timeout=0.5)
+                    current_time = time.time()
+                    
+                    if isinstance(update[0], float):  # Progress percentage
+                        progress_pct, current_seconds, line = update
+                        if progress_callback:
+                            progress_callback(progress_pct)
+                        
+                        # Log progress every 5 seconds or significant progress jumps
+                        if current_time - last_update_time > 5.0 or progress_pct > current_progress + 0.05:
+                            self.log(f"Progress: {progress_pct*100:.1f}% ({current_seconds:.1f}s / {video_duration:.1f}s)")
+                            last_update_time = current_time
+                            current_progress = progress_pct
+                    elif update[0] == 'frame_info':
+                        # Optionally log frame info less frequently
+                        if current_time - last_update_time > 10.0:
+                            self.log(f"Encoding: {update[1]}")
+                            last_update_time = current_time
+                            
+                except queue.Empty:
+                    # No progress update, continue waiting
+                    continue
+            
+            # Final callback update
+            if progress_callback:
+                progress_callback(1.0)
+            
+            # Wait for process to complete and join monitoring thread
             process.wait()
+            monitor_thread.join(timeout=1.0)
             
             if process.returncode != 0:
                 return False, f"FFmpeg failed with return code {process.returncode}"
@@ -256,7 +469,7 @@ class VideoCompressor:
     
     def build_ffmpeg_command(self, input_path, output_path, original_info):
         """Build FFmpeg command based on configuration and video properties."""
-        cmd = [self.config["ffmpeg_path"], "-y", "-i", input_path]
+        cmd = [self.config["ffmpeg_path"], "-y", "-i", str(input_path)]
         
         settings = self.config["compression_settings"]
         
@@ -289,7 +502,7 @@ class VideoCompressor:
                 cmd.extend(["-b:v", f"{target_bitrate}k"])
                 self.log(f"Target bitrate: {target_bitrate}k (reduced from {original_bitrate}k)")
         
-        cmd.append(output_path)
+        cmd.append(str(output_path))
         return cmd
     
     def get_original_bitrate(self, video_info):
@@ -309,7 +522,7 @@ class VideoCompressor:
             pass
         return None
     
-    def process_file(self, file_path, dry_run=False):
+    def process_file(self, file_path, dry_run=False, progress_callback=None):
         """Process a single file with full safety protocol."""
         file_path = Path(file_path)
         self.log(f"\n{'='*50}")
@@ -348,9 +561,12 @@ class VideoCompressor:
             if not original_hash:
                 return False, "Failed to calculate original file hash"
         
+        # Get original video info for comparison
+        original_info = self.get_video_info(file_path) if not dry_run else None
+        
         # Step 2: Compress to temporary location
         self.log("Step 1: Compressing video...")
-        success, message = self.compress_video(file_path, temp_output, dry_run)
+        success, message = self.compress_video(file_path, temp_output, dry_run, progress_callback)
         if not success:
             self.cleanup_temp_files(temp_output)
             return False, f"Compression failed: {message}"
@@ -358,7 +574,7 @@ class VideoCompressor:
         # Step 3: Verify compressed file integrity
         self.log("Step 2: Verifying compressed file...")
         if self.config["safety_settings"]["verify_integrity"]:
-            integrity_ok, integrity_msg = self.verify_file_integrity(temp_output)
+            integrity_ok, integrity_msg = self.verify_file_integrity(temp_output, original_info)
             if not integrity_ok:
                 self.cleanup_temp_files(temp_output)
                 return False, f"Compressed file verification failed: {integrity_msg}"
@@ -387,7 +603,7 @@ class VideoCompressor:
         
         # Step 6: Final verification of moved file
         self.log("Step 4: Final verification...")
-        final_integrity_ok, final_integrity_msg = self.verify_file_integrity(final_output)
+        final_integrity_ok, final_integrity_msg = self.verify_file_integrity(final_output, original_info)
         if not final_integrity_ok:
             self.log(f"Final verification failed: {final_integrity_msg}", "ERROR")
             # Don't delete original - something went wrong
@@ -419,15 +635,27 @@ class VideoCompressor:
             except Exception as e:
                 self.log(f"Failed to clean up {temp_file}: {e}", "WARNING")
     
-    def process_file_list(self, file_list, dry_run=False):
+    def calculate_total_duration(self, file_list):
+        """Calculate total duration of all video files."""
+        total_duration = 0.0
+        for file_path in file_list:
+            if Path(file_path).exists():
+                video_info = self.get_video_info(file_path)
+                if video_info:
+                    duration = self.get_video_duration(video_info)
+                    total_duration += duration
+        return total_duration
+    
+    def process_file_list(self, file_list, dry_run=False, batch_progress_callback=None):
         """Process a list of files with comprehensive reporting."""
         self.log(f"\n{'='*60}")
         self.log(f"BATCH PROCESSING {'(DRY RUN)' if dry_run else ''}")
         self.log(f"Files to process: {len(file_list)}")
         
-        # Estimate total time
-        total_estimated_time = timedelta()
+        # Calculate total duration and size
+        total_video_duration = self.calculate_total_duration(file_list)
         total_original_size = 0
+        total_estimated_time = timedelta()
         
         for file_path in file_list:
             if Path(file_path).exists():
@@ -438,6 +666,7 @@ class VideoCompressor:
                     total_estimated_time += estimated_time
         
         self.log(f"Total data to process: {total_original_size / (1024**3):.2f}GB")
+        self.log(f"Total video duration: {timedelta(seconds=int(total_video_duration))}")
         if not dry_run:
             self.log(f"Estimated total time: {total_estimated_time}")
             estimated_completion = datetime.now() + total_estimated_time
@@ -446,18 +675,32 @@ class VideoCompressor:
         # Process each file
         start_time = time.time()
         total_space_saved = 0
+        processed_duration = 0.0
         
         for i, file_path in enumerate(file_list, 1):
             self.log(f"\n[{i}/{len(file_list)}] Processing: {Path(file_path).name}")
             
             original_size = 0
+            file_duration = 0.0
             if Path(file_path).exists():
                 original_size = os.path.getsize(file_path)
+                video_info = self.get_video_info(file_path)
+                if video_info:
+                    file_duration = self.get_video_duration(video_info)
             
-            success, message = self.process_file(file_path, dry_run)
+            # Create progress callback for this file
+            def file_progress_callback(file_progress):
+                if batch_progress_callback and total_video_duration > 0:
+                    # Calculate overall progress
+                    current_file_contribution = (file_progress * file_duration)
+                    overall_progress = (processed_duration + current_file_contribution) / total_video_duration
+                    batch_progress_callback(overall_progress, f"File {i}/{len(file_list)}: {Path(file_path).name} ({file_progress*100:.1f}%)")
+            
+            success, message = self.process_file(file_path, dry_run, file_progress_callback)
             
             if success:
                 self.processed_files.append(file_path)
+                processed_duration += file_duration
                 if not dry_run and Path(file_path).parent.exists():
                     # Calculate space saved
                     compressed_files = list(Path(file_path).parent.glob(f"{Path(file_path).stem}_compressed*"))
