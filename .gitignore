@@ -1,0 +1,46 @@
+# Temporary files
+temp_config.json
+*.tmp
+*.temp
+
+# Log files
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary compression files
+/tmp/
+temp/
+
+# User-specific config files (users should copy from examples)
+secrets.json
+
+# Test files
+test_files/
+test_videos/

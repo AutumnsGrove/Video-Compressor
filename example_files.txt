@@ -1,0 +1,11 @@
+# Example video file list
+# Add your video file paths here, one per line
+# Remove the # to uncomment lines
+
+# /path/to/your/video1.mp4
+# /path/to/your/video2.mov  
+# /path/to/your/video3.mkv
+
+# Example paths (update with your actual files):
+# /Users/username/Movies/large_video.mp4
+# /Volumes/ExternalDrive/recordings/meeting.mov
