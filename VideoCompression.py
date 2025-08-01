@@ -14,6 +14,9 @@ from pathlib import Path
 import hashlib
 import argparse
 import psutil
+import queue
+import threading
+import re
 
 class VideoCompressor:
     def __init__(self, config_path="config.json"):
@@ -512,9 +515,6 @@ class VideoCompressor:
         
         # Start compression with progress monitoring
         start_time = time.time()
-        import threading
-        import queue
-        import re
         
         try:
             self.log(f"🚀 Starting FFmpeg process...", "INFO")
@@ -568,20 +568,26 @@ class VideoCompressor:
                                 last_size = current_size
                                 
                                 # Don't overwhelm the queue
-                                if not progress_queue.full():
+                                try:
                                     progress_queue.put((
                                         progress_pct, current_seconds, current_fps, 
                                         current_size, line
-                                    ))
+                                    ), timeout=0.1)
+                                except queue.Full:
+                                    pass  # Skip if queue is full
                         
                         # Capture any error messages
                         elif 'error' in line.lower() or 'failed' in line.lower():
-                            if not progress_queue.full():
-                                progress_queue.put(('error', line))
+                            try:
+                                progress_queue.put(('error', line), timeout=0.1)
+                            except queue.Full:
+                                pass
                                 
                 except Exception as e:
-                    if not progress_queue.full():
-                        progress_queue.put(('monitor_error', str(e)))
+                    try:
+                        progress_queue.put(('monitor_error', str(e)), timeout=0.1)
+                    except queue.Full:
+                        pass
             
             # Start monitoring thread
             monitor_thread = threading.Thread(target=monitor_stderr, daemon=True)
@@ -593,10 +599,11 @@ class VideoCompressor:
             current_progress = 0.0
             
             while process.poll() is None:
+                current_time = time.time()  # Initialize current_time at start of loop
+                
                 try:
                     # Shorter timeout for more responsive monitoring
                     update = progress_queue.get(timeout=0.2)
-                    current_time = time.time()
                     
                     if isinstance(update[0], float):  # Progress percentage
                         progress_pct, current_seconds, fps, size_kb, line = update
