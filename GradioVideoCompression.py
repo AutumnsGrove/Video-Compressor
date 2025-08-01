@@ -231,16 +231,43 @@ def create_interface():
                     os.remove(temp_config_path)
                 
         except Exception as e:
-            # Enhanced error reporting
+            # Enhanced error reporting with log file reference
             error_msg = f"❌ **Processing Error**\n\n**Error Type:** {type(e).__name__}\n**Details:** {str(e)}"
             
+            # Show the most recent log file for debugging
+            try:
+                log_dir = Path("./logs")
+                if log_dir.exists():
+                    log_files = sorted(log_dir.glob("video_compression_*.log"), key=lambda x: x.stat().st_mtime)
+                    if log_files:
+                        latest_log = log_files[-1]
+                        error_msg += f"\n\n📄 **Check detailed log:** `{latest_log}`"
+                        
+                        # Try to read the last few lines of the log for immediate context
+                        try:
+                            with open(latest_log, 'r') as f:
+                                lines = f.readlines()
+                                if lines:
+                                    recent_lines = lines[-10:]  # Last 10 lines
+                                    error_msg += "\n\n🔍 **Recent log entries:**\n```\n"
+                                    error_msg += "".join(recent_lines)
+                                    error_msg += "\n```"
+                        except:
+                            pass
+            except:
+                pass
+            
             # Add troubleshooting hints for common large file issues
-            if "disk space" in str(e).lower():
-                error_msg += "\n\n💡 **Tip:** Large files require significant temporary space. Check available disk space."
+            if "disk space" in str(e).lower() or "no space left" in str(e).lower():
+                error_msg += "\n\n💡 **Tip:** Large files require significant temporary space. The system now uses same-filesystem temp directories to avoid cross-drive issues."
             elif "timeout" in str(e).lower():
                 error_msg += "\n\n💡 **Tip:** Large files may require extended processing time. This is normal for files >10GB."
             elif "memory" in str(e).lower():
                 error_msg += "\n\n💡 **Tip:** Very large files may hit system memory limits. Try processing files individually."
+            elif "cross-device" in str(e).lower() or "filesystem" in str(e).lower():
+                error_msg += "\n\n💡 **Tip:** Cross-filesystem issue detected. The system should now create temp files on the same drive as your video."
+            elif "permission" in str(e).lower():
+                error_msg += "\n\n💡 **Tip:** Permission denied. Check that you have write access to the video file directory."
             
             return error_msg
     

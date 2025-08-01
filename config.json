@@ -21,7 +21,8 @@
     "enhanced_monitoring": true,
     "progress_update_interval": 10,
     "hash_chunk_size_mb": 5,
-    "extended_timeouts": true
+    "extended_timeouts": true,
+    "use_same_filesystem": true
   },
   "logging_settings": {
     "max_log_files": 5,

@@ -54,7 +54,8 @@ class VideoCompressor:
                     "enhanced_monitoring": True,
                     "progress_update_interval": 10,
                     "hash_chunk_size_mb": 5,
-                    "extended_timeouts": True
+                    "extended_timeouts": True,
+                    "use_same_filesystem": True
                 },
                 "logging_settings": {
                     "max_log_files": 5,
@@ -516,6 +517,11 @@ class VideoCompressor:
         import re
         
         try:
+            self.log(f"🚀 Starting FFmpeg process...", "INFO")
+            self.log(f"   Command: {' '.join(cmd[:5])}...", "DEBUG")  # Log first few args
+            self.log(f"   Input file: {input_path}", "DEBUG")
+            self.log(f"   Output file: {output_path}", "DEBUG")
+            
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -648,7 +654,16 @@ class VideoCompressor:
                 pass
             
             if process.returncode != 0:
-                return False, f"FFmpeg failed with return code {process.returncode}"
+                # Capture stderr for detailed error info
+                try:
+                    stderr_output = process.stderr.read() if process.stderr else "No stderr available"
+                except:
+                    stderr_output = "Could not read stderr"
+                
+                error_msg = f"FFmpeg failed with return code {process.returncode}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                self.log(f"   FFmpeg stderr: {stderr_output[-500:] if stderr_output else 'N/A'}", "ERROR")  # Last 500 chars
+                return False, f"{error_msg}. Check logs for details."
             
             end_time = time.time()
             duration = timedelta(seconds=int(end_time - start_time))
@@ -657,7 +672,18 @@ class VideoCompressor:
             return True, "Compression successful"
             
         except Exception as e:
-            return False, f"Compression error: {e}"
+            error_msg = f"Compression error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            
+            # Add specific troubleshooting for common issues
+            if "No space left on device" in str(e):
+                self.log("💡 Troubleshooting: Try using a different temp directory with more space", "ERROR")
+            elif "Permission denied" in str(e):
+                self.log("💡 Troubleshooting: Check file permissions and write access to temp directory", "ERROR")
+            elif "Cross-device link" in str(e):
+                self.log("💡 Troubleshooting: Temp directory is on different filesystem - this should be fixed automatically", "ERROR")
+            
+            return False, error_msg
     
     def build_ffmpeg_command(self, input_path, output_path, original_info):
         """Build FFmpeg command based on configuration and video properties."""
@@ -742,8 +768,16 @@ class VideoCompressor:
             self.log(space_msg, "ERROR")
             return False, space_msg
         
-        # Create temp directory
-        temp_dir = Path(self.config["temp_dir"])
+        # Create temp directory on same filesystem as input file for efficiency
+        if self.config.get("large_file_settings", {}).get("use_same_filesystem", True):
+            # Create temp directory next to the input file
+            temp_dir = file_path.parent / ".video_compression_temp"
+            self.log(f"🗂️  Using same-filesystem temp dir: {temp_dir}", "INFO")
+        else:
+            # Use configured temp directory
+            temp_dir = Path(self.config["temp_dir"])
+            self.log(f"🗂️  Using configured temp dir: {temp_dir}", "INFO")
+        
         temp_dir.mkdir(exist_ok=True)
         
         # Generate temporary output path
@@ -766,11 +800,21 @@ class VideoCompressor:
         original_info = self.get_video_info(file_path) if not dry_run else None
         
         # Step 2: Compress to temporary location
-        self.log("Step 1: Compressing video...")
-        success, message = self.compress_video(file_path, temp_output, dry_run, progress_callback)
-        if not success:
+        self.log("🎬 Step 1: Starting video compression...", "INFO")
+        self.log(f"   Input: {file_path}", "DEBUG")
+        self.log(f"   Temp output: {temp_output}", "DEBUG")
+        self.log(f"   Temp dir filesystem: {temp_dir}", "DEBUG")
+        
+        try:
+            success, message = self.compress_video(file_path, temp_output, dry_run, progress_callback)
+            if not success:
+                self.log(f"❌ Compression failed: {message}", "ERROR")
+                self.cleanup_temp_files(temp_output)
+                return False, f"Compression failed: {message}"
+        except Exception as e:
+            self.log(f"❌ Compression exception: {type(e).__name__}: {e}", "ERROR")
             self.cleanup_temp_files(temp_output)
-            return False, f"Compression failed: {message}"
+            return False, f"Compression exception: {e}"
         
         # Step 3: Verify compressed file integrity
         self.log("Step 2: Verifying compressed file...")
@@ -794,11 +838,31 @@ class VideoCompressor:
         
         # Step 5: Move compressed file to final location (same directory as original)
         final_output = file_path.parent / output_name
-        self.log(f"Step 3: Moving to final location: {final_output}")
+        self.log(f"📂 Step 3: Moving to final location: {final_output}", "INFO")
+        self.log(f"   Source: {temp_output}", "DEBUG")
+        self.log(f"   Destination: {final_output}", "DEBUG")
         
         try:
+            # Ensure the temp file actually exists before moving
+            if not temp_output.exists():
+                error_msg = f"Temp file does not exist: {temp_output}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return False, error_msg
+                
+            # Check file sizes match expectations
+            temp_size = temp_output.stat().st_size
+            if temp_size == 0:
+                error_msg = f"Temp file is empty (0 bytes): {temp_output}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                self.cleanup_temp_files(temp_output)
+                return False, error_msg
+            
+            self.log(f"✅ Temp file ready for move: {temp_size / (1024**3):.2f}GB", "DEBUG")
             shutil.move(str(temp_output), str(final_output))
+            self.log(f"✅ File moved successfully", "INFO")
+            
         except Exception as e:
+            self.log(f"❌ Failed to move compressed file: {type(e).__name__}: {e}", "ERROR")
             self.cleanup_temp_files(temp_output)
             return False, f"Failed to move compressed file: {e}"
         
@@ -827,14 +891,24 @@ class VideoCompressor:
         return True, f"File processed successfully. Saved {space_saved / (1024**3):.2f}GB"
     
     def cleanup_temp_files(self, *temp_files):
-        """Clean up temporary files."""
+        """Clean up temporary files and directories."""
         for temp_file in temp_files:
             try:
                 if temp_file and Path(temp_file).exists():
-                    Path(temp_file).unlink()
-                    self.log(f"Cleaned up temp file: {temp_file}")
+                    temp_path = Path(temp_file)
+                    temp_path.unlink()
+                    self.log(f"🧹 Cleaned up temp file: {temp_file}", "DEBUG")
+                    
+                    # Also clean up temp directory if it's empty and was created by us
+                    temp_dir = temp_path.parent
+                    if (temp_dir.name == ".video_compression_temp" and 
+                        temp_dir.exists() and 
+                        not any(temp_dir.iterdir())):
+                        temp_dir.rmdir()
+                        self.log(f"🧹 Cleaned up empty temp directory: {temp_dir}", "DEBUG")
+                        
             except Exception as e:
-                self.log(f"Failed to clean up {temp_file}: {e}", "WARNING")
+                self.log(f"⚠️  Failed to clean up {temp_file}: {e}", "WARNING")
     
     def calculate_total_duration(self, file_list):
         """Calculate total duration of all video files."""
@@ -913,12 +987,10 @@ class VideoCompressor:
                 self.failed_files.append((file_path, message))
                 self.log(f"❌ FAILED: {message}", "ERROR")
                 
-                # Ask user if they want to continue on failure
+                # In batch processing, log the failure but continue with other files
                 if not dry_run:
-                    response = input("\nFile processing failed. Continue with remaining files? (y/n): ")
-                    if response.lower() != 'y':
-                        self.log("User chose to stop processing.", "INFO")
-                        break
+                    self.log(f"⚠️  Continuing with remaining files despite failure", "WARNING")
+                    # Don't break - continue processing other files
         
         # Final summary
         end_time = time.time()
