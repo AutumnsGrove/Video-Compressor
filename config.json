@@ -11,9 +11,22 @@
     "crf": 23
   },
   "safety_settings": {
-    "min_free_space_gb": 10,
+    "min_free_space_gb": 15,
     "verify_integrity": true,
     "create_backup_hash": true,
     "max_retries": 3
+  },
+  "large_file_settings": {
+    "threshold_gb": 10,
+    "enhanced_monitoring": true,
+    "progress_update_interval": 10,
+    "hash_chunk_size_mb": 5,
+    "extended_timeouts": true
+  },
+  "logging_settings": {
+    "max_log_files": 5,
+    "max_log_size_mb": 10,
+    "console_level": "INFO",
+    "file_level": "DEBUG"
   }
 }

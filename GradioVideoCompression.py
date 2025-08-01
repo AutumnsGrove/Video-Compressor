@@ -159,10 +159,16 @@ def create_interface():
             class UILogger:
                 def __init__(self):
                     self.lines = []
+                    self.important_lines = []
                 
                 def log(self, message, level="INFO"):
-                    self.lines.append(f"[{level}] {message}")
-                    output_lines.append(f"[{level}] {message}")
+                    formatted_msg = f"[{level}] {message}"
+                    self.lines.append(formatted_msg)
+                    output_lines.append(formatted_msg)
+                    
+                    # Keep track of important messages for summary
+                    if level in ["WARNING", "ERROR", "CRITICAL"] or "Progress:" in message:
+                        self.important_lines.append(formatted_msg)
             
             # Override compressor logging for UI
             ui_logger = UILogger()
@@ -182,26 +188,38 @@ def create_interface():
                 progress(1.0, desc="Processing complete!")
                 
                 # Generate summary
+                # Count large files
+                large_files = [f for f in files_to_process if os.path.exists(f) and os.path.getsize(f) > 10*1024**3]
+                
                 summary = f"""
-# Video Compression Results
+# 🎬 Video Compression Results
 
-**Files Processed:** {len(files_to_process)}
-**Mode:** {'Dry Run' if dry_run else 'Live Processing'}
-**Success:** {len(compressor.processed_files)}
-**Failed:** {len(compressor.failed_files)}
+**Files Processed:** {len(files_to_process)} {'🔥 (' + str(len(large_files)) + ' large files >10GB)' if large_files else ''}
+**Mode:** {'🧪 Dry Run' if dry_run else '⚡ Live Processing'}
+**Success:** ✅ {len(compressor.processed_files)}
+**Failed:** ❌ {len(compressor.failed_files)}
 
-## Settings Used:
+## ⚙️ Settings Used:
 - **Bitrate Reduction:** {target_bitrate_reduction*100}%
 - **Codec:** {video_codec}
 - **Preset:** {preset}
 - **CRF:** {crf}
-- **Preserve 10-bit:** {preserve_10bit}
-- **Preserve Metadata:** {preserve_metadata}
+- **Preserve 10-bit:** {'✅' if preserve_10bit else '❌'}
+- **Preserve Metadata:** {'✅' if preserve_metadata else '❌'}
 
-## Processing Log:
+## 📊 Processing Details:
 """
                 
-                summary += "\n".join(output_lines[-50:])  # Last 50 log lines
+                # Show important messages first, then recent activity
+                important_msgs = ui_logger.important_lines[-20:] if hasattr(ui_logger, 'important_lines') else []
+                recent_msgs = output_lines[-30:]
+                
+                if important_msgs:
+                    summary += "\n### 🎯 Key Messages:\n"
+                    summary += "\n".join(important_msgs)
+                    summary += "\n\n### 📋 Recent Activity:\n"
+                
+                summary += "\n".join(recent_msgs)
                 
                 return summary
                 
@@ -213,7 +231,18 @@ def create_interface():
                     os.remove(temp_config_path)
                 
         except Exception as e:
-            return f"❌ **Processing Error**\n\n{str(e)}"
+            # Enhanced error reporting
+            error_msg = f"❌ **Processing Error**\n\n**Error Type:** {type(e).__name__}\n**Details:** {str(e)}"
+            
+            # Add troubleshooting hints for common large file issues
+            if "disk space" in str(e).lower():
+                error_msg += "\n\n💡 **Tip:** Large files require significant temporary space. Check available disk space."
+            elif "timeout" in str(e).lower():
+                error_msg += "\n\n💡 **Tip:** Large files may require extended processing time. This is normal for files >10GB."
+            elif "memory" in str(e).lower():
+                error_msg += "\n\n💡 **Tip:** Very large files may hit system memory limits. Try processing files individually."
+            
+            return error_msg
     
     # Load default config for UI
     default_config = load_config_for_ui()
@@ -253,9 +282,11 @@ def create_interface():
                 gr.Markdown("### ⚠️ Safety Features")
                 gr.Markdown("""
                 - **Never deletes originals** until compressed file is verified
-                - **Disk space checking** before each operation  
-                - **File integrity verification** after compression
-                - **Comprehensive logging** of all operations
+                - **Enhanced disk space checking** with cross-filesystem support  
+                - **Comprehensive file integrity verification** after compression
+                - **Structured logging** with automatic cleanup and rotation
+                - **Large file optimization** (>10GB) with extended timeouts
+                - **Progress monitoring** with ETA calculations
                 - **Rollback capability** if anything fails
                 """)
         
@@ -377,6 +408,13 @@ def create_interface():
         - **CRF**: 23 for balanced quality/size, 20 for higher quality
         - **Codec**: libx265 for best compression efficiency  
         - **Preset**: medium for good balance of speed/compression
+        
+        ### 🔥 Large File Support (>10GB):
+        
+        - **Enhanced Progress Monitoring**: Real-time FPS, size, and ETA
+        - **Extended Timeouts**: Automatic scaling based on file size
+        - **Optimized Hashing**: 5MB chunks for faster verification
+        - **Memory Management**: Prevents queue overflow during processing
         """)
     
     return interface

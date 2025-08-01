@@ -7,16 +7,19 @@ import subprocess
 import shutil
 import tempfile
 import time
+import logging
+import logging.handlers
 from datetime import datetime, timedelta
 from pathlib import Path
 import hashlib
 import argparse
+import psutil
 
 class VideoCompressor:
     def __init__(self, config_path="config.json"):
         self.config = self.load_config(config_path)
-        self.log_file = None
-        self.setup_logging()
+        self.logger = None
+        self.setup_enhanced_logging()
         self.processed_files = []
         self.failed_files = []
         
@@ -41,10 +44,23 @@ class VideoCompressor:
                     "crf": 23
                 },
                 "safety_settings": {
-                    "min_free_space_gb": 10,
+                    "min_free_space_gb": 15,
                     "verify_integrity": True,
                     "create_backup_hash": True,
                     "max_retries": 3
+                },
+                "large_file_settings": {
+                    "threshold_gb": 10,
+                    "enhanced_monitoring": True,
+                    "progress_update_interval": 10,
+                    "hash_chunk_size_mb": 5,
+                    "extended_timeouts": True
+                },
+                "logging_settings": {
+                    "max_log_files": 5,
+                    "max_log_size_mb": 10,
+                    "console_level": "INFO",
+                    "file_level": "DEBUG"
                 }
             }
             with open(config_path, 'w') as f:
@@ -54,87 +70,208 @@ class VideoCompressor:
             print(f"Error parsing config file: {e}")
             sys.exit(1)
     
-    def setup_logging(self):
-        """Setup comprehensive logging system."""
+    def setup_enhanced_logging(self):
+        """Setup enhanced logging system with rotation and levels."""
         log_dir = Path(self.config["log_dir"])
         log_dir.mkdir(exist_ok=True)
         
+        # Clean up old log files based on config
+        max_logs = self.config.get("logging_settings", {}).get("max_log_files", 5)
+        self.cleanup_old_logs(log_dir, max_logs)
+        
+        # Setup main logger
+        self.logger = logging.getLogger('VideoCompressor')
+        self.logger.setLevel(logging.DEBUG)
+        
+        # Clear any existing handlers
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
+        
+        # Create formatters
+        detailed_formatter = logging.Formatter(
+            '%(asctime)s [%(levelname)8s] %(name)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_formatter = logging.Formatter(
+            '[%(levelname)s] %(message)s'
+        )
+        
+        # Get configurable log levels first
+        console_level = getattr(logging, self.config.get("logging_settings", {}).get("console_level", "INFO"))
+        file_level = getattr(logging, self.config.get("logging_settings", {}).get("file_level", "DEBUG"))
+        
+        # File handler with configurable rotation
+        max_size_mb = self.config.get("logging_settings", {}).get("max_log_size_mb", 10)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = log_dir / f"video_compression_{timestamp}.log"
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=max_size_mb*1024*1024, backupCount=3
+        )
+        file_handler.setLevel(file_level)
+        file_handler.setFormatter(detailed_formatter)
         
-        self.log_file = open(log_file, 'w')
-        self.log(f"=== Video Compression Session Started ===")
-        self.log(f"Timestamp: {datetime.now()}")
-        self.log(f"Config: {json.dumps(self.config, indent=2)}")
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(console_level)
+        console_handler.setFormatter(console_formatter)
         
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+        
+        # Log session start
+        self.logger.info("=== Video Compression Session Started ===")
+        self.logger.info(f"Timestamp: {datetime.now()}")
+        self.logger.debug(f"Config: {json.dumps(self.config, indent=2)}")
+        self.logger.info(f"Log file: {log_file}")
+        
+    def cleanup_old_logs(self, log_dir, keep_count=5):
+        """Clean up old log files, keeping only the most recent ones."""
+        try:
+            log_files = sorted(
+                [f for f in log_dir.glob("video_compression_*.log*")],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )
+            
+            # Remove files beyond keep_count
+            for old_log in log_files[keep_count:]:
+                try:
+                    old_log.unlink()
+                    print(f"🧹 Cleaned up old log: {old_log.name}")
+                except Exception as e:
+                    print(f"⚠️  Failed to remove old log {old_log}: {e}")
+        except Exception as e:
+            print(f"⚠️  Error during log cleanup: {e}")
+    
     def log(self, message, level="INFO"):
-        """Log message to both console and file."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_message = f"[{timestamp}] [{level}] {message}"
-        print(log_message)
-        if self.log_file:
-            self.log_file.write(log_message + "\n")
-            self.log_file.flush()
+        """Enhanced logging with proper levels and structured output."""
+        if not self.logger:
+            print(f"[{level}] {message}")
+            return
+        
+        level_map = {
+            "DEBUG": self.logger.debug,
+            "INFO": self.logger.info,
+            "WARNING": self.logger.warning,
+            "ERROR": self.logger.error,
+            "CRITICAL": self.logger.critical
+        }
+        
+        log_func = level_map.get(level.upper(), self.logger.info)
+        log_func(message)
     
     def check_disk_space(self, file_path, safety_multiplier=2.5):
-        """Check if there's enough disk space for safe compression."""
-        file_size = os.path.getsize(file_path)
-        temp_dir = Path(self.config["temp_dir"])
-        
-        # Get available space on temp directory filesystem
-        statvfs = os.statvfs(temp_dir.parent)
-        available_bytes = statvfs.f_frsize * statvfs.f_bavail
-        available_gb = available_bytes / (1024**3)
-        
-        # Required space: original file size * safety multiplier
-        required_bytes = file_size * safety_multiplier
-        required_gb = required_bytes / (1024**3)
-        
-        min_free_space = self.config["safety_settings"]["min_free_space_gb"]
-        
-        self.log(f"Disk space check:")
-        self.log(f"  Available: {available_gb:.2f}GB")
-        self.log(f"  Required: {required_gb:.2f}GB")
-        self.log(f"  File size: {file_size / (1024**3):.2f}GB")
-        self.log(f"  Min free space: {min_free_space}GB")
-        
-        if available_gb < (required_gb + min_free_space):
-            return False, f"Insufficient disk space. Need {required_gb + min_free_space:.2f}GB, have {available_gb:.2f}GB"
-        
-        return True, "Sufficient disk space available"
+        """Enhanced disk space checking with cross-filesystem support."""
+        try:
+            file_size = os.path.getsize(file_path)
+            temp_dir = Path(self.config["temp_dir"])
+            temp_dir.mkdir(exist_ok=True)  # Ensure temp dir exists
+            
+            # Use psutil for more accurate disk space info
+            temp_usage = psutil.disk_usage(str(temp_dir))
+            file_parent_usage = psutil.disk_usage(str(Path(file_path).parent))
+            
+            temp_available_gb = temp_usage.free / (1024**3)
+            file_parent_available_gb = file_parent_usage.free / (1024**3)
+            
+            # Required space calculation for large files
+            required_bytes = file_size * safety_multiplier
+            required_gb = required_bytes / (1024**3)
+            
+            min_free_space = self.config["safety_settings"]["min_free_space_gb"]
+            
+            self.log(f"💾 Enhanced disk space analysis:", "DEBUG")
+            self.log(f"   File size: {file_size / (1024**3):.2f}GB", "INFO")
+            self.log(f"   Required temp space: {required_gb:.2f}GB", "INFO")
+            self.log(f"   Temp directory available: {temp_available_gb:.2f}GB", "INFO")
+            self.log(f"   File directory available: {file_parent_available_gb:.2f}GB", "DEBUG")
+            self.log(f"   Minimum required free: {min_free_space}GB", "DEBUG")
+            
+            # Check temp directory space
+            if temp_available_gb < (required_gb + min_free_space):
+                return False, f"Insufficient temp space. Need {required_gb + min_free_space:.2f}GB, have {temp_available_gb:.2f}GB"
+            
+            # Check if we can write the final file
+            if file_parent_available_gb < (file_size / (1024**3) + min_free_space):
+                return False, f"Insufficient space for final file. Need {file_size / (1024**3) + min_free_space:.2f}GB, have {file_parent_available_gb:.2f}GB"
+            
+            self.log(f"✅ Sufficient disk space available", "INFO")
+            return True, "Sufficient disk space available"
+            
+        except Exception as e:
+            self.log(f"Error checking disk space: {e}", "ERROR")
+            return False, f"Disk space check failed: {e}"
     
-    def calculate_file_hash(self, file_path, chunk_size=8192):
-        """Calculate SHA-256 hash of file for integrity verification."""
-        self.log(f"Calculating hash for {file_path}")
+    def calculate_file_hash(self, file_path, chunk_size=None):
+        """Calculate SHA-256 hash optimized for large files."""
+        if chunk_size is None:
+            # Use config-based chunk size for large files
+            chunk_size_mb = self.config.get("large_file_settings", {}).get("hash_chunk_size_mb", 5)
+            chunk_size = chunk_size_mb * 1024 * 1024
+        file_size = os.path.getsize(file_path)
+        self.log(f"🔐 Calculating hash for {Path(file_path).name} ({file_size / (1024**3):.2f}GB)", "INFO")
+        
         hash_sha256 = hashlib.sha256()
+        bytes_processed = 0
+        last_progress_log = 0
         
         try:
             with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(chunk_size), b""):
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
                     hash_sha256.update(chunk)
-            return hash_sha256.hexdigest()
+                    bytes_processed += len(chunk)
+                    
+                    # Log progress every 10% for large files (>1GB)
+                    if file_size > 1024**3:
+                        progress = (bytes_processed / file_size) * 100
+                        if progress - last_progress_log >= 10:
+                            self.log(f"   Hash progress: {progress:.1f}%", "DEBUG")
+                            last_progress_log = progress
+            
+            hash_result = hash_sha256.hexdigest()
+            self.log(f"✅ Hash calculated: {hash_result[:16]}...", "DEBUG")
+            return hash_result
+            
         except Exception as e:
             self.log(f"Error calculating hash: {e}", "ERROR")
             return None
     
     def get_video_info(self, file_path):
-        """Get detailed video information using ffprobe."""
+        """Get detailed video information with enhanced timeout for large files."""
+        file_size_gb = os.path.getsize(file_path) / (1024**3)
+        
+        # Dynamic timeout based on file size and config
+        if self.config.get("large_file_settings", {}).get("extended_timeouts", True):
+            timeout = max(30, int(30 + file_size_gb * 15))  # More generous for large files
+        else:
+            timeout = 30
+        
         cmd = [
             self.config["ffmpeg_path"].replace("ffmpeg", "ffprobe"),
             "-v", "quiet",
             "-print_format", "json",
             "-show_format",
             "-show_streams",
-            file_path
+            str(file_path)
         ]
         
+        self.log(f"🔍 Analyzing video info (timeout: {timeout}s)", "DEBUG")
+        
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             if result.returncode == 0:
-                return json.loads(result.stdout)
+                video_info = json.loads(result.stdout)
+                self.log(f"✅ Video analysis complete", "DEBUG")
+                return video_info
             else:
                 self.log(f"ffprobe error: {result.stderr}", "ERROR")
                 return None
+        except subprocess.TimeoutExpired:
+            self.log(f"ffprobe timeout after {timeout}s for large file", "ERROR")
+            return None
         except Exception as e:
             self.log(f"Error getting video info: {e}", "ERROR")
             return None
@@ -384,76 +521,131 @@ class VideoCompressor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
-                bufsize=0  # Unbuffered
+                bufsize=1  # Line buffered for better progress tracking
             )
             
-            # Queue for thread communication
-            progress_queue = queue.Queue()
+            # Enhanced progress monitoring for large files
+            progress_queue = queue.Queue(maxsize=100)  # Prevent memory buildup
             
             def monitor_stderr():
-                """Monitor stderr for progress in separate thread."""
+                """Enhanced progress monitoring optimized for large files."""
                 current_progress = 0.0
-                for line in iter(process.stderr.readline, ''):
-                    line = line.strip()
-                    if line:
-                        # Look for time progress in various formats
+                last_fps = 0
+                last_size = 0
+                
+                try:
+                    for line in iter(process.stderr.readline, ''):
+                        if not line:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        # Parse multiple progress indicators
                         time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2}\.\d{2})', line)
+                        fps_match = re.search(r'fps=\s*([\d.]+)', line)
+                        size_match = re.search(r'size=\s*(\d+)kB', line)
+                        
                         if time_match and video_duration > 0:
                             hours, minutes, seconds = time_match.groups()
                             current_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
                             progress_pct = min(current_seconds / video_duration, 1.0)
                             
-                            # Only update if progress increased significantly
-                            if progress_pct > current_progress + 0.01:  # Update every 1%
+                            # Extract additional metrics
+                            current_fps = float(fps_match.group(1)) if fps_match else last_fps
+                            current_size = int(size_match.group(1)) if size_match else last_size
+                            
+                            # Only update if progress increased significantly (0.5% for large files)
+                            if progress_pct > current_progress + 0.005:
                                 current_progress = progress_pct
-                                progress_queue.put((progress_pct, current_seconds, line))
+                                last_fps = current_fps
+                                last_size = current_size
+                                
+                                # Don't overwhelm the queue
+                                if not progress_queue.full():
+                                    progress_queue.put((
+                                        progress_pct, current_seconds, current_fps, 
+                                        current_size, line
+                                    ))
                         
-                        # Also capture frame info for additional progress tracking
-                        frame_match = re.search(r'frame=\s*(\d+)', line)
-                        if frame_match:
-                            progress_queue.put(('frame_info', line))
+                        # Capture any error messages
+                        elif 'error' in line.lower() or 'failed' in line.lower():
+                            if not progress_queue.full():
+                                progress_queue.put(('error', line))
+                                
+                except Exception as e:
+                    if not progress_queue.full():
+                        progress_queue.put(('monitor_error', str(e)))
             
             # Start monitoring thread
             monitor_thread = threading.Thread(target=monitor_stderr, daemon=True)
             monitor_thread.start()
             
-            # Process progress updates
+            # Enhanced progress processing for large files
             last_update_time = time.time()
+            last_log_time = time.time()
             current_progress = 0.0
             
             while process.poll() is None:
                 try:
-                    # Check for progress updates with timeout
-                    update = progress_queue.get(timeout=0.5)
+                    # Shorter timeout for more responsive monitoring
+                    update = progress_queue.get(timeout=0.2)
                     current_time = time.time()
                     
                     if isinstance(update[0], float):  # Progress percentage
-                        progress_pct, current_seconds, line = update
+                        progress_pct, current_seconds, fps, size_kb, line = update
+                        
+                        # Update progress callback more frequently
                         if progress_callback:
                             progress_callback(progress_pct)
                         
-                        # Log progress every 5 seconds or significant progress jumps
-                        if current_time - last_update_time > 5.0 or progress_pct > current_progress + 0.05:
-                            self.log(f"Progress: {progress_pct*100:.1f}% ({current_seconds:.1f}s / {video_duration:.1f}s)")
-                            last_update_time = current_time
-                            current_progress = progress_pct
-                    elif update[0] == 'frame_info':
-                        # Optionally log frame info less frequently
-                        if current_time - last_update_time > 10.0:
-                            self.log(f"Encoding: {update[1]}")
-                            last_update_time = current_time
+                        # Log progress with enhanced info for large files
+                        if (current_time - last_log_time > 10.0 or  # Every 10 seconds
+                            progress_pct > current_progress + 0.02):  # Or every 2%
                             
+                            time_remaining = "unknown"
+                            if progress_pct > 0.01:  # Avoid division by zero
+                                elapsed = current_time - start_time
+                                total_estimated = elapsed / progress_pct
+                                remaining = total_estimated - elapsed
+                                time_remaining = str(timedelta(seconds=int(remaining)))
+                            
+                            self.log(
+                                f"📊 Progress: {progress_pct*100:.1f}% | "
+                                f"{current_seconds:.1f}s/{video_duration:.1f}s | "
+                                f"FPS: {fps:.1f} | Size: {size_kb//1024:.1f}MB | "
+                                f"ETA: {time_remaining}",
+                                "INFO"
+                            )
+                            last_log_time = current_time
+                            current_progress = progress_pct
+                    
+                    elif update[0] == 'error':
+                        self.log(f"FFmpeg error: {update[1]}", "ERROR")
+                    elif update[0] == 'monitor_error':
+                        self.log(f"Progress monitoring error: {update[1]}", "WARNING")
+                        
                 except queue.Empty:
-                    # No progress update, continue waiting
+                    # Check if process is still running every few seconds
+                    if current_time - last_update_time > 30.0:
+                        self.log("❤️  Large file processing continues...", "INFO")
+                        last_update_time = current_time
                     continue
             
             # Final callback update
             if progress_callback:
                 progress_callback(1.0)
             
-            # Wait for process to complete and join monitoring thread
+            # Wait for process to complete and cleanup monitoring
             process.wait()
-            monitor_thread.join(timeout=1.0)
+            monitor_thread.join(timeout=5.0)  # Longer timeout for large files
+            
+            # Process any remaining queue items
+            try:
+                while not progress_queue.empty():
+                    progress_queue.get_nowait()
+            except queue.Empty:
+                pass
             
             if process.returncode != 0:
                 return False, f"FFmpeg failed with return code {process.returncode}"
@@ -523,11 +715,20 @@ class VideoCompressor:
         return None
     
     def process_file(self, file_path, dry_run=False, progress_callback=None):
-        """Process a single file with full safety protocol."""
+        """Process a single file with enhanced large file support."""
         file_path = Path(file_path)
-        self.log(f"\n{'='*50}")
-        self.log(f"Processing: {file_path.name}")
-        self.log(f"Full path: {file_path}")
+        file_size_gb = os.path.getsize(file_path) / (1024**3)
+        
+        self.log(f"\n{'='*60}", "INFO")
+        self.log(f"🎥 Processing: {file_path.name} ({file_size_gb:.2f}GB)", "INFO")
+        self.log(f"📁 Full path: {file_path}", "DEBUG")
+        
+        # Log special handling for large files
+        if file_size_gb > 10:
+            self.log(f"🔥 LARGE FILE DETECTED: Enabling enhanced processing mode", "WARNING")
+            self.log(f"   • Extended timeouts and monitoring enabled", "INFO")
+            self.log(f"   • Progress updates every 10 seconds", "INFO")
+            self.log(f"   • Enhanced disk space verification", "INFO")
         
         # Safety checks
         if not file_path.exists():
@@ -739,9 +940,13 @@ class VideoCompressor:
     
     def __del__(self):
         """Cleanup when object is destroyed."""
-        if self.log_file:
-            self.log("=== Video Compression Session Ended ===")
-            self.log_file.close()
+        if self.logger:
+            self.log("=== Video Compression Session Ended ===", "INFO")
+            # Close file handlers
+            for handler in self.logger.handlers[:]:
+                if isinstance(handler, (logging.FileHandler, logging.handlers.RotatingFileHandler)):
+                    handler.close()
+                    self.logger.removeHandler(handler)
 
 
 def main():
