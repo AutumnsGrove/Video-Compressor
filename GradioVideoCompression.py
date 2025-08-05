@@ -187,8 +187,7 @@ def create_interface():
                 
                 progress(1.0, desc="Processing complete!")
                 
-                # Generate summary
-                # Count large files
+                # Generate enhanced summary with file analysis for dry runs
                 large_files = [f for f in files_to_process if os.path.exists(f) and os.path.getsize(f) > 10*1024**3]
                 
                 summary = f"""
@@ -206,9 +205,55 @@ def create_interface():
 - **CRF:** {crf}
 - **Preserve 10-bit:** {'✅' if preserve_10bit else '❌'}
 - **Preserve Metadata:** {'✅' if preserve_metadata else '❌'}
-
-## 📊 Processing Details:
 """
+                
+                # Add file-by-file analysis for dry runs
+                if dry_run and len(files_to_process) <= 5:  # Show detailed analysis for up to 5 files
+                    summary += "\n## 📊 File Size Analysis:\n"
+                    for file_path in files_to_process:
+                        if os.path.exists(file_path):
+                            try:
+                                # Get video info and analyze
+                                video_info = compressor.get_video_info(file_path)
+                                if video_info:
+                                    breakdown = compressor.analyze_file_size_breakdown(file_path, video_info)
+                                    if breakdown:
+                                        file_name = os.path.basename(file_path)
+                                        file_size_gb = os.path.getsize(file_path) / (1024**3)
+                                        
+                                        summary += f"\n### 📁 {file_name}\n"
+                                        summary += f"- **Size:** {file_size_gb:.2f}GB | **Duration:** {breakdown['duration_formatted']}\n"
+                                        
+                                        if breakdown['total_bitrate_kbps']:
+                                            summary += f"- **Bitrate:** {breakdown['total_bitrate_kbps']//1000:.1f}Mbps\n"
+                                        
+                                        summary += f"- **Contribution:** 📹 Video {breakdown['video_contribution']:.1f}% | 🔊 Audio {breakdown['audio_contribution']:.1f}% | 📦 Other {breakdown['other_contribution']:.1f}%\n"
+                                        
+                                        # Show what's driving file size
+                                        size_drivers = []
+                                        for detail in breakdown['details']:
+                                            if detail['size_factors']:
+                                                stream_type = "📹" if detail['type'] == 'video' else "🔊"
+                                                size_drivers.extend([f"{stream_type} {factor}" for factor in detail['size_factors']])
+                                        
+                                        if size_drivers:
+                                            summary += f"- **Size Drivers:** {', '.join(size_drivers[:3])}{'...' if len(size_drivers) > 3 else ''}\n"
+                                        
+                                        # Show compression estimate
+                                        if breakdown['total_bitrate_kbps']:
+                                            target_reduction = target_bitrate_reduction
+                                            estimated_new_bitrate = breakdown['total_bitrate_kbps'] * target_reduction
+                                            estimated_new_size = (estimated_new_bitrate * breakdown['duration_seconds']) / 8 / 1024 / 1024  # GB
+                                            potential_savings = file_size_gb - estimated_new_size
+                                            savings_percent = (potential_savings / file_size_gb) * 100
+                                            
+                                            summary += f"- **Estimated Result:** {estimated_new_size:.2f}GB (Save {potential_savings:.2f}GB / {savings_percent:.1f}%)\n"
+                            except Exception as e:
+                                summary += f"\n### ❌ {os.path.basename(file_path)}\n- Error analyzing: {str(e)}\n"
+                elif dry_run and len(files_to_process) > 5:
+                    summary += f"\n## 📊 Batch Analysis:\n*File-by-file analysis available for batches of 5 or fewer files*\n"
+                
+                summary += "\n## 📋 Processing Details:\n"
                 
                 # Show important messages first, then recent activity
                 important_msgs = ui_logger.important_lines[-20:] if hasattr(ui_logger, 'important_lines') else []
@@ -421,9 +466,17 @@ def create_interface():
         4. **Dry Run First**: Always test with dry run mode enabled initially
         5. **Process**: Run actual compression after verifying dry run results
         
+        ### 🧪 Enhanced Dry Run Analysis:
+        
+        - **File Size Breakdown**: Shows what percentage is video, audio, and container overhead
+        - **Size Driver Detection**: Identifies factors making files large (4K resolution, high bitrate, 10-bit color, etc.)
+        - **Compression Estimates**: Predicts file size reduction and space savings
+        - **Stream Analysis**: Detailed codec, resolution, and quality information
+        - **Batch Support**: Analyzes up to 5 files individually, summarizes larger batches
+        
         ### ⚠️ Important Safety Notes:
         
-        - **Always run a dry run first** to preview operations
+        - **Always run a dry run first** to preview operations and understand what's driving file size
         - **Ensure you have backups** of important files
         - **Monitor disk space** - compression requires temporary storage
         - **Check the logs** in the results for any issues
@@ -442,6 +495,7 @@ def create_interface():
         - **Extended Timeouts**: Automatic scaling based on file size
         - **Optimized Hashing**: 5MB chunks for faster verification
         - **Memory Management**: Prevents queue overflow during processing
+        - **Detailed Analysis**: Comprehensive breakdown of what makes large files so large
         """)
     
     return interface
