@@ -549,13 +549,24 @@ class VideoCompressor:
                 # Get video bitrate
                 video_bitrate = 0
                 if "bit_rate" in stream:
-                    video_bitrate = int(stream["bit_rate"]) // 1000  # Convert to kbps
-                    video_bitrate_total += video_bitrate
+                    try:
+                        video_bitrate = int(stream["bit_rate"]) // 1000  # Convert to kbps
+                        video_bitrate_total += video_bitrate
+                    except (ValueError, TypeError):
+                        video_bitrate = 0
+                
+                # Convert width and height to int safely
+                try:
+                    width = int(width) if width else 0
+                    height = int(height) if height else 0
+                except (ValueError, TypeError):
+                    width = 0
+                    height = 0
                 
                 # Analyze what drives video size
                 resolution_factor = width * height
-                is_10bit = "10" in pix_fmt
-                is_hdr = "2020" in profile.lower() or "hdr" in profile.lower()
+                is_10bit = "10" in str(pix_fmt)
+                is_hdr = "2020" in str(profile).lower() or "hdr" in str(profile).lower()
                 
                 detail = {
                     "type": "video",
@@ -604,8 +615,22 @@ class VideoCompressor:
                 # Get audio bitrate
                 audio_bitrate = 0
                 if "bit_rate" in stream:
-                    audio_bitrate = int(stream["bit_rate"]) // 1000  # Convert to kbps
-                    audio_bitrate_total += audio_bitrate
+                    try:
+                        audio_bitrate = int(stream["bit_rate"]) // 1000  # Convert to kbps
+                        audio_bitrate_total += audio_bitrate
+                    except (ValueError, TypeError):
+                        audio_bitrate = 0
+                
+                # Convert sample_rate and channels to int safely
+                try:
+                    sample_rate = int(sample_rate) if sample_rate else 0
+                except (ValueError, TypeError):
+                    sample_rate = 0
+                
+                try:
+                    channels = int(channels) if channels else 0
+                except (ValueError, TypeError):
+                    channels = 0
                 
                 detail = {
                     "type": "audio",
@@ -668,38 +693,51 @@ class VideoCompressor:
             # Analyze file size breakdown
             breakdown = self.analyze_file_size_breakdown(input_path, video_info)
             
-            self.log("[DRY RUN] 📊 FILE SIZE ANALYSIS:", "INFO")
-            file_size_gb = os.path.getsize(input_path) / (1024**3)
-            self.log(f"[DRY RUN]   File Size: {file_size_gb:.2f}GB ({breakdown['file_size_mb']:.1f}MB)", "INFO")
-            self.log(f"[DRY RUN]   Duration: {breakdown['duration_formatted']} ({breakdown['duration_seconds']:.1f}s)", "INFO")
-            
-            if breakdown['total_bitrate_kbps']:
-                self.log(f"[DRY RUN]   Total Bitrate: {breakdown['total_bitrate_kbps']//1000:.1f}Mbps", "INFO")
-            
-            self.log("[DRY RUN] 🎯 WHAT'S MAKING THIS FILE LARGE:", "INFO")
-            self.log(f"[DRY RUN]   📹 Video Contribution: {breakdown['video_contribution']:.1f}%", "INFO")
-            self.log(f"[DRY RUN]   🔊 Audio Contribution: {breakdown['audio_contribution']:.1f}%", "INFO")
-            self.log(f"[DRY RUN]   📦 Container/Other: {breakdown['other_contribution']:.1f}%", "INFO")
-            
-            # Show detailed breakdown per stream
-            for detail in breakdown['details']:
-                if detail['type'] == 'video':
-                    self.log(f"[DRY RUN]   📹 Video Stream {detail['stream_index']+1}:", "INFO")
-                    self.log(f"[DRY RUN]      Codec: {detail['codec']} | Resolution: {detail['resolution']} | FPS: {detail['fps']}", "INFO")
-                    if detail['bitrate_kbps'] > 0:
-                        self.log(f"[DRY RUN]      Bitrate: {detail['bitrate_kbps']//1000:.1f}Mbps", "INFO")
-                    if detail['is_10bit']:
-                        self.log(f"[DRY RUN]      Color: 10-bit ({detail['pixel_format']})", "INFO")
-                    if detail['size_factors']:
-                        self.log(f"[DRY RUN]      Size Drivers: {', '.join(detail['size_factors'])}", "WARNING")
+            if breakdown:
+                self.log("[DRY RUN] 📊 FILE SIZE ANALYSIS:", "INFO")
+                file_size_gb = os.path.getsize(input_path) / (1024**3)
+                self.log(f"[DRY RUN]   File Size: {file_size_gb:.2f}GB ({breakdown['file_size_mb']:.1f}MB)", "INFO")
+                self.log(f"[DRY RUN]   Duration: {breakdown['duration_formatted']} ({breakdown['duration_seconds']:.1f}s)", "INFO")
+            else:
+                self.log("[DRY RUN] 📊 FILE SIZE ANALYSIS: Unable to analyze (using basic info)", "WARNING")
+                file_size_gb = os.path.getsize(input_path) / (1024**3)
+                self.log(f"[DRY RUN]   File Size: {file_size_gb:.2f}GB", "INFO")
                 
-                elif detail['type'] == 'audio':
-                    self.log(f"[DRY RUN]   🔊 Audio Stream {detail['stream_index']+1}:", "INFO")
-                    self.log(f"[DRY RUN]      Codec: {detail['codec']} | Channels: {detail['channels']} | Sample Rate: {detail['sample_rate']}Hz", "INFO")
-                    if detail['bitrate_kbps'] > 0:
-                        self.log(f"[DRY RUN]      Bitrate: {detail['bitrate_kbps']}kbps", "INFO")
-                    if detail['size_factors']:
-                        self.log(f"[DRY RUN]      Size Drivers: {', '.join(detail['size_factors'])}", "WARNING")
+                # Get basic duration info
+                format_info = video_info.get("format", {})
+                if "duration" in format_info:
+                    duration = float(format_info["duration"])
+                    duration_formatted = str(timedelta(seconds=int(duration)))
+                    self.log(f"[DRY RUN]   Duration: {duration_formatted} ({duration:.1f}s)", "INFO")
+            
+            if breakdown:
+                if breakdown['total_bitrate_kbps']:
+                    self.log(f"[DRY RUN]   Total Bitrate: {breakdown['total_bitrate_kbps']//1000:.1f}Mbps", "INFO")
+                
+                self.log("[DRY RUN] 🎯 WHAT'S MAKING THIS FILE LARGE:", "INFO")
+                self.log(f"[DRY RUN]   📹 Video Contribution: {breakdown['video_contribution']:.1f}%", "INFO")
+                self.log(f"[DRY RUN]   🔊 Audio Contribution: {breakdown['audio_contribution']:.1f}%", "INFO")
+                self.log(f"[DRY RUN]   📦 Container/Other: {breakdown['other_contribution']:.1f}%", "INFO")
+                
+                # Show detailed breakdown per stream
+                for detail in breakdown['details']:
+                    if detail['type'] == 'video':
+                        self.log(f"[DRY RUN]   📹 Video Stream {detail['stream_index']+1}:", "INFO")
+                        self.log(f"[DRY RUN]      Codec: {detail['codec']} | Resolution: {detail['resolution']} | FPS: {detail['fps']}", "INFO")
+                        if detail['bitrate_kbps'] > 0:
+                            self.log(f"[DRY RUN]      Bitrate: {detail['bitrate_kbps']//1000:.1f}Mbps", "INFO")
+                        if detail['is_10bit']:
+                            self.log(f"[DRY RUN]      Color: 10-bit ({detail['pixel_format']})", "INFO")
+                        if detail['size_factors']:
+                            self.log(f"[DRY RUN]      Size Drivers: {', '.join(detail['size_factors'])}", "WARNING")
+                    
+                    elif detail['type'] == 'audio':
+                        self.log(f"[DRY RUN]   🔊 Audio Stream {detail['stream_index']+1}:", "INFO")
+                        self.log(f"[DRY RUN]      Codec: {detail['codec']} | Channels: {detail['channels']} | Sample Rate: {detail['sample_rate']}Hz", "INFO")
+                        if detail['bitrate_kbps'] > 0:
+                            self.log(f"[DRY RUN]      Bitrate: {detail['bitrate_kbps']}kbps", "INFO")
+                        if detail['size_factors']:
+                            self.log(f"[DRY RUN]      Size Drivers: {', '.join(detail['size_factors'])}", "WARNING")
             
             self.log("[DRY RUN] ⚙️  COMPRESSION SETTINGS TO BE APPLIED:", "INFO")
             compression_settings = self.config["compression_settings"]
@@ -707,7 +745,7 @@ class VideoCompressor:
                 self.log(f"[DRY RUN]   {key}: {value}", "INFO")
             
             # Estimate potential savings
-            if breakdown['total_bitrate_kbps']:
+            if breakdown and breakdown['total_bitrate_kbps']:
                 target_reduction = compression_settings.get("target_bitrate_reduction", 0.5)
                 estimated_new_bitrate = breakdown['total_bitrate_kbps'] * target_reduction
                 estimated_new_size = (estimated_new_bitrate * breakdown['duration_seconds']) / 8 / 1024  # MB
@@ -717,6 +755,8 @@ class VideoCompressor:
                 self.log(f"[DRY RUN] 💾 ESTIMATED COMPRESSION RESULTS:", "INFO")
                 self.log(f"[DRY RUN]   Estimated New Size: {estimated_new_size/1024:.2f}GB", "INFO")
                 self.log(f"[DRY RUN]   Potential Savings: {potential_savings/1024:.2f}GB ({savings_percent:.1f}%)", "INFO")
+            else:
+                self.log(f"[DRY RUN] 💾 ESTIMATED COMPRESSION RESULTS: Unable to estimate (no bitrate info)", "WARNING")
             
             return True, "Dry run completed with detailed analysis"
         
