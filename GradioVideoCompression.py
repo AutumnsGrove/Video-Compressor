@@ -227,7 +227,11 @@ def create_interface():
                                         if breakdown['total_bitrate_kbps']:
                                             summary += f"- **Bitrate:** {breakdown['total_bitrate_kbps']//1000:.1f}Mbps\n"
                                         
-                                        summary += f"- **Contribution:** 📹 Video {breakdown['video_contribution']:.1f}% | 🔊 Audio {breakdown['audio_contribution']:.1f}% | 📦 Other {breakdown['other_contribution']:.1f}%\n"
+                                        # Only show contribution if we have real data
+                                        if breakdown['video_contribution'] is not None:
+                                            summary += f"- **Contribution:** 📹 Video {breakdown['video_contribution']:.1f}% | 🔊 Audio {breakdown['audio_contribution']:.1f}% | 📦 Other {breakdown['other_contribution']:.1f}%\n"
+                                        else:
+                                            summary += f"- **Contribution:** No bitrate data available\n"
                                         
                                         # Show what's driving file size
                                         size_drivers = []
@@ -239,15 +243,24 @@ def create_interface():
                                         if size_drivers:
                                             summary += f"- **Size Drivers:** {', '.join(size_drivers[:3])}{'...' if len(size_drivers) > 3 else ''}\n"
                                         
-                                        # Show compression estimate
-                                        if breakdown['total_bitrate_kbps']:
+                                        # Show compression estimate - only if reliable
+                                        if breakdown['total_bitrate_kbps'] and breakdown['total_bitrate_kbps'] > 0:
                                             target_reduction = target_bitrate_reduction
-                                            estimated_new_bitrate = breakdown['total_bitrate_kbps'] * target_reduction
+                                            crf_factor = max(0.3, 1.0 - (crf - 18) * 0.05)  # Account for quality settings
+                                            realistic_reduction = target_reduction * crf_factor
+                                            
+                                            estimated_new_bitrate = breakdown['total_bitrate_kbps'] * realistic_reduction
                                             estimated_new_size = (estimated_new_bitrate * breakdown['duration_seconds']) / 8 / 1024 / 1024  # GB
                                             potential_savings = file_size_gb - estimated_new_size
                                             savings_percent = (potential_savings / file_size_gb) * 100
                                             
-                                            summary += f"- **Estimated Result:** {estimated_new_size:.2f}GB (Save {potential_savings:.2f}GB / {savings_percent:.1f}%)\n"
+                                            # Only show if estimate seems reasonable
+                                            if 10 <= savings_percent <= 95:
+                                                summary += f"- **Estimated Result:** {estimated_new_size:.2f}GB (Save {potential_savings:.2f}GB / {savings_percent:.1f}%)\n"
+                                            else:
+                                                summary += f"- **Estimated Result:** Unable to calculate reliable estimate\n"
+                                        else:
+                                            summary += f"- **Estimated Result:** No bitrate data for estimation\n"
                             except Exception as e:
                                 summary += f"\n### ❌ {os.path.basename(file_path)}\n- Error analyzing: {str(e)}\n"
                 elif dry_run and len(files_to_process) > 5:

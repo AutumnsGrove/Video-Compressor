@@ -657,22 +657,21 @@ class VideoCompressor:
                 
                 breakdown["details"].append(detail)
             
-            # Calculate contributions as percentages
-            if total_bitrate and total_bitrate > 0:
-                if video_bitrate_total > 0:
-                    breakdown["video_contribution"] = (video_bitrate_total / (total_bitrate // 1000)) * 100
-                if audio_bitrate_total > 0:
-                    breakdown["audio_contribution"] = (audio_bitrate_total / (total_bitrate // 1000)) * 100
+            # Calculate contributions as percentages - ONLY if we have real data
+            total_stream_bitrate = video_bitrate_total + audio_bitrate_total
+            
+            if total_stream_bitrate > 0:
+                # Use actual stream bitrates for accurate percentages
+                breakdown["video_contribution"] = (video_bitrate_total / total_stream_bitrate) * 100
+                breakdown["audio_contribution"] = (audio_bitrate_total / total_stream_bitrate) * 100
                 breakdown["other_contribution"] = 100 - breakdown["video_contribution"] - breakdown["audio_contribution"]
+                self.log(f"Real bitrate data - Video: {video_bitrate_total}kbps, Audio: {audio_bitrate_total}kbps", "DEBUG")
             else:
-                # Fallback estimation if no bitrate info
-                if video_streams and audio_streams:
-                    breakdown["video_contribution"] = 85  # Typical video contribution
-                    breakdown["audio_contribution"] = 10   # Typical audio contribution
-                    breakdown["other_contribution"] = 5    # Container overhead
-                elif video_streams:
-                    breakdown["video_contribution"] = 95
-                    breakdown["other_contribution"] = 5
+                # No real bitrate data available - don't show fake percentages
+                breakdown["video_contribution"] = None
+                breakdown["audio_contribution"] = None  
+                breakdown["other_contribution"] = None
+                self.log("No bitrate data available - skipping contribution analysis", "DEBUG")
             
             return breakdown
             
@@ -714,10 +713,14 @@ class VideoCompressor:
                 if breakdown['total_bitrate_kbps']:
                     self.log(f"[DRY RUN]   Total Bitrate: {breakdown['total_bitrate_kbps']//1000:.1f}Mbps", "INFO")
                 
-                self.log("[DRY RUN] 🎯 WHAT'S MAKING THIS FILE LARGE:", "INFO")
-                self.log(f"[DRY RUN]   📹 Video Contribution: {breakdown['video_contribution']:.1f}%", "INFO")
-                self.log(f"[DRY RUN]   🔊 Audio Contribution: {breakdown['audio_contribution']:.1f}%", "INFO")
-                self.log(f"[DRY RUN]   📦 Container/Other: {breakdown['other_contribution']:.1f}%", "INFO")
+                # Only show contribution analysis if we have real data
+                if breakdown['video_contribution'] is not None:
+                    self.log("[DRY RUN] 🎯 WHAT'S MAKING THIS FILE LARGE:", "INFO")
+                    self.log(f"[DRY RUN]   📹 Video Contribution: {breakdown['video_contribution']:.1f}%", "INFO")
+                    self.log(f"[DRY RUN]   🔊 Audio Contribution: {breakdown['audio_contribution']:.1f}%", "INFO")
+                    self.log(f"[DRY RUN]   📦 Container/Other: {breakdown['other_contribution']:.1f}%", "INFO")
+                else:
+                    self.log("[DRY RUN] 🎯 CONTRIBUTION ANALYSIS: No bitrate data available", "INFO")
                 
                 # Show detailed breakdown per stream
                 for detail in breakdown['details']:
@@ -744,19 +747,31 @@ class VideoCompressor:
             for key, value in compression_settings.items():
                 self.log(f"[DRY RUN]   {key}: {value}", "INFO")
             
-            # Estimate potential savings
-            if breakdown and breakdown['total_bitrate_kbps']:
+            # Estimate potential savings - only if we have reliable bitrate data
+            if breakdown and breakdown['total_bitrate_kbps'] and breakdown['total_bitrate_kbps'] > 0:
                 target_reduction = compression_settings.get("target_bitrate_reduction", 0.5)
-                estimated_new_bitrate = breakdown['total_bitrate_kbps'] * target_reduction
+                
+                # More realistic compression estimation based on typical H.265 efficiency
+                # H.265 typically achieves 50% bitrate reduction for same quality, 
+                # but we're also reducing quality (CRF), so total reduction is higher
+                crf_factor = max(0.3, 1.0 - (compression_settings.get("crf", 23) - 18) * 0.05)  # Lower CRF = less compression
+                realistic_reduction = target_reduction * crf_factor  # Combined effect
+                
+                estimated_new_bitrate = breakdown['total_bitrate_kbps'] * realistic_reduction
                 estimated_new_size = (estimated_new_bitrate * breakdown['duration_seconds']) / 8 / 1024  # MB
                 potential_savings = breakdown['file_size_mb'] - estimated_new_size
                 savings_percent = (potential_savings / breakdown['file_size_mb']) * 100
                 
-                self.log(f"[DRY RUN] 💾 ESTIMATED COMPRESSION RESULTS:", "INFO")
-                self.log(f"[DRY RUN]   Estimated New Size: {estimated_new_size/1024:.2f}GB", "INFO")
-                self.log(f"[DRY RUN]   Potential Savings: {potential_savings/1024:.2f}GB ({savings_percent:.1f}%)", "INFO")
+                # Only show if the estimate seems reasonable (10-95% compression)
+                if 10 <= savings_percent <= 95:
+                    self.log(f"[DRY RUN] 💾 ESTIMATED COMPRESSION RESULTS:", "INFO")
+                    self.log(f"[DRY RUN]   Estimated New Size: {estimated_new_size/1024:.2f}GB", "INFO")
+                    self.log(f"[DRY RUN]   Potential Savings: {potential_savings/1024:.2f}GB ({savings_percent:.1f}%)", "INFO")
+                    self.log(f"[DRY RUN]   Note: Estimate based on bitrate reduction + quality settings", "INFO")
+                else:
+                    self.log(f"[DRY RUN] 💾 COMPRESSION ESTIMATE: Unreliable calculation, skipping estimate", "INFO")
             else:
-                self.log(f"[DRY RUN] 💾 ESTIMATED COMPRESSION RESULTS: Unable to estimate (no bitrate info)", "WARNING")
+                self.log(f"[DRY RUN] 💾 COMPRESSION ESTIMATE: No bitrate data available for estimation", "INFO")
             
             return True, "Dry run completed with detailed analysis"
         
