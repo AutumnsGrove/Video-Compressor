@@ -519,7 +519,7 @@ def main():
     interface = create_interface()
     interface.launch(
         server_name="0.0.0.0",
-        server_port=7862,
+        server_port=int(os.environ.get('GRADIO_SERVER_PORT', 7863)),
         share=False,
         show_error=True
     )
