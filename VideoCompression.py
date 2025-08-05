@@ -1167,7 +1167,29 @@ class VideoCompressor:
             self.log(f"Failed to delete original file: {e}", "ERROR")
             return False, f"Failed to delete original file: {e}"
         
-        # Step 8: Log success
+        # Step 8: Clean up temp directory
+        if temp_dir.exists() and temp_dir.name == ".video_compression_temp":
+            try:
+                # Remove any remaining files in temp directory
+                for remaining_file in temp_dir.iterdir():
+                    try:
+                        if remaining_file.is_file():
+                            remaining_file.unlink()
+                            self.log(f"🧹 Cleaned up remaining temp file: {remaining_file.name}", "DEBUG")
+                    except Exception as e:
+                        self.log(f"⚠️  Failed to clean up remaining file {remaining_file}: {e}", "WARNING")
+                
+                # Remove the temp directory itself
+                if not any(temp_dir.iterdir()):  # Only if empty
+                    temp_dir.rmdir()
+                    self.log(f"🧹 Cleaned up temp directory: {temp_dir}", "INFO")
+                else:
+                    self.log(f"⚠️  Temp directory not empty, leaving: {temp_dir}", "WARNING")
+                    
+            except Exception as e:
+                self.log(f"⚠️  Failed to clean up temp directory {temp_dir}: {e}", "WARNING")
+
+        # Step 9: Log success
         self.log(f"✅ SUCCESS: {file_path.name} compressed successfully")
         self.log(f"   New file: {final_output}")
         self.log(f"   Space saved: {space_saved / (1024**3):.2f}GB")
@@ -1176,23 +1198,51 @@ class VideoCompressor:
     
     def cleanup_temp_files(self, *temp_files):
         """Clean up temporary files and directories."""
+        temp_dirs_to_check = set()
+        
         for temp_file in temp_files:
             try:
                 if temp_file and Path(temp_file).exists():
                     temp_path = Path(temp_file)
+                    temp_dirs_to_check.add(temp_path.parent)
                     temp_path.unlink()
                     self.log(f"🧹 Cleaned up temp file: {temp_file}", "DEBUG")
-                    
-                    # Also clean up temp directory if it's empty and was created by us
-                    temp_dir = temp_path.parent
-                    if (temp_dir.name == ".video_compression_temp" and 
-                        temp_dir.exists() and 
-                        not any(temp_dir.iterdir())):
-                        temp_dir.rmdir()
-                        self.log(f"🧹 Cleaned up empty temp directory: {temp_dir}", "DEBUG")
                         
             except Exception as e:
                 self.log(f"⚠️  Failed to clean up {temp_file}: {e}", "WARNING")
+        
+        # Clean up any temp directories that are now empty
+        for temp_dir in temp_dirs_to_check:
+            try:
+                if (temp_dir.name == ".video_compression_temp" and 
+                    temp_dir.exists() and 
+                    not any(temp_dir.iterdir())):
+                    temp_dir.rmdir()
+                    self.log(f"🧹 Cleaned up empty temp directory: {temp_dir}", "DEBUG")
+            except Exception as e:
+                self.log(f"⚠️  Failed to clean up temp directory {temp_dir}: {e}", "WARNING")
+    
+    def cleanup_all_temp_directories(self):
+        """Clean up all .video_compression_temp directories in current working area."""
+        try:
+            # Find all temp directories that might have been created
+            for temp_dir in Path(".").rglob(".video_compression_temp"):
+                if temp_dir.is_dir():
+                    try:
+                        # Remove any remaining files
+                        for remaining_file in temp_dir.iterdir():
+                            if remaining_file.is_file():
+                                remaining_file.unlink()
+                                self.log(f"🧹 Cleaned up remaining temp file: {remaining_file}", "DEBUG")
+                        
+                        # Remove directory if empty
+                        if not any(temp_dir.iterdir()):
+                            temp_dir.rmdir()
+                            self.log(f"🧹 Final cleanup of temp directory: {temp_dir}", "INFO")
+                    except Exception as e:
+                        self.log(f"⚠️  Failed to clean up temp directory {temp_dir}: {e}", "WARNING")
+        except Exception as e:
+            self.log(f"⚠️  Error during final temp directory cleanup: {e}", "WARNING")
     
     def calculate_total_duration(self, file_list):
         """Calculate total duration of all video files."""
@@ -1293,11 +1343,22 @@ class VideoCompressor:
             self.log(f"\nFailed files:")
             for file_path, error in self.failed_files:
                 self.log(f"  - {file_path}: {error}")
+        
+        # Final cleanup of any remaining temp directories
+        self.log(f"🧹 Performing final temp directory cleanup...")
+        self.cleanup_all_temp_directories()
     
     def __del__(self):
         """Cleanup when object is destroyed."""
         if self.logger:
             self.log("=== Video Compression Session Ended ===", "INFO")
+            
+            # Final temp directory cleanup on session end
+            try:
+                self.cleanup_all_temp_directories()
+            except:
+                pass  # Don't let cleanup errors break destruction
+            
             # Close file handlers
             for handler in self.logger.handlers[:]:
                 if isinstance(handler, (logging.FileHandler, logging.handlers.RotatingFileHandler)):
