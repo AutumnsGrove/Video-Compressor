@@ -17,6 +17,7 @@ import psutil
 import queue
 import threading
 import re
+import platform
 
 class VideoCompressor:
     def __init__(self, config_path="config.json"):
@@ -44,7 +45,8 @@ class VideoCompressor:
                     "preserve_metadata": True,
                     "video_codec": "libx265",
                     "preset": "medium",
-                    "crf": 23
+                    "crf": 23,
+                    "enable_hardware_acceleration": True
                 },
                 "safety_settings": {
                     "min_free_space_gb": 15,
@@ -969,24 +971,161 @@ class VideoCompressor:
             
             return False, error_msg
     
+    def detect_hardware_acceleration(self):
+        """Detect Apple Silicon and test VideoToolbox hardware acceleration availability."""
+        try:
+            # Check if hardware acceleration is enabled in config
+            if not self.config.get("compression_settings", {}).get("enable_hardware_acceleration", True):
+                self.log("🔧 Hardware acceleration disabled in config", "INFO")
+                return None
+            
+            # Detect Apple Silicon
+            processor = platform.processor().lower()
+            machine = platform.machine().lower()
+            
+            # Check for Apple Silicon indicators
+            is_apple_silicon = (
+                "arm" in processor or 
+                "arm64" in machine or 
+                machine == "arm64" or
+                machine.startswith("arm")
+            )
+            
+            if not is_apple_silicon:
+                self.log(f"🔧 Not Apple Silicon (processor: {processor}, machine: {machine})", "DEBUG")
+                return None
+            
+            self.log(f"🔧 Apple Silicon detected (processor: {processor}, machine: {machine})", "INFO")
+            
+            # Test VideoToolbox availability with a quick probe
+            test_cmd = [
+                self.config["ffmpeg_path"],
+                "-f", "lavfi",
+                "-i", "testsrc=duration=1:size=320x240:rate=1",
+                "-c:v", "h264_videotoolbox",
+                "-t", "1",
+                "-f", "null", "-"
+            ]
+            
+            self.log("🔧 Testing VideoToolbox availability...", "DEBUG")
+            
+            try:
+                result = subprocess.run(
+                    test_cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=10
+                )
+                
+                if result.returncode == 0:
+                    self.log("✅ VideoToolbox h264_videotoolbox encoder available", "INFO")
+                    
+                    # Also test HEVC VideoToolbox
+                    hevc_test_cmd = test_cmd.copy()
+                    hevc_test_cmd[hevc_test_cmd.index("h264_videotoolbox")] = "hevc_videotoolbox"
+                    
+                    hevc_result = subprocess.run(
+                        hevc_test_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    
+                    has_hevc = hevc_result.returncode == 0
+                    if has_hevc:
+                        self.log("✅ VideoToolbox hevc_videotoolbox encoder available", "INFO")
+                    else:
+                        self.log("⚠️  VideoToolbox HEVC encoder not available", "DEBUG")
+                    
+                    return {
+                        "type": "videotoolbox",
+                        "h264_encoder": "h264_videotoolbox",
+                        "hevc_encoder": "hevc_videotoolbox" if has_hevc else None,
+                        "quality_param": "-q:v",
+                        "pixel_format_10bit": "p010le"
+                    }
+                else:
+                    self.log(f"❌ VideoToolbox test failed: {result.stderr}", "WARNING")
+                    return None
+                    
+            except subprocess.TimeoutExpired:
+                self.log("❌ VideoToolbox test timed out", "WARNING")
+                return None
+            except Exception as e:
+                self.log(f"❌ VideoToolbox test error: {e}", "WARNING")
+                return None
+                
+        except Exception as e:
+            self.log(f"❌ Hardware acceleration detection error: {e}", "ERROR")
+            return None
+    
     def build_ffmpeg_command(self, input_path, output_path, original_info):
-        """Build FFmpeg command based on configuration and video properties."""
+        """Build FFmpeg command based on configuration and video properties with hardware acceleration."""
         cmd = [self.config["ffmpeg_path"], "-y", "-i", str(input_path)]
         
         settings = self.config["compression_settings"]
         
-        # Video codec settings
-        cmd.extend(["-c:v", settings["video_codec"]])
-        cmd.extend(["-preset", settings["preset"]])
-        cmd.extend(["-crf", str(settings["crf"])])
+        # Detect hardware acceleration
+        hw_accel = self.detect_hardware_acceleration()
         
-        # Preserve 10-bit if specified
-        if settings["preserve_10bit"]:
-            # Check if original is 10-bit
+        # Determine codec and parameters
+        video_codec = settings["video_codec"]
+        use_hardware = False
+        
+        if hw_accel and hw_accel["type"] == "videotoolbox":
+            # Check original video stream to determine best codec
             video_stream = next((s for s in original_info["streams"] if s["codec_type"] == "video"), None)
-            if video_stream and "pix_fmt" in video_stream:
-                if "10" in video_stream["pix_fmt"]:
-                    cmd.extend(["-pix_fmt", "yuv420p10le"])
+            original_codec = video_stream.get("codec_name", "").lower() if video_stream else ""
+            
+            # Choose hardware codec based on original and availability
+            if settings["video_codec"] == "libx265" and hw_accel["hevc_encoder"]:
+                video_codec = hw_accel["hevc_encoder"]
+                use_hardware = True
+                self.log("🚀 Using VideoToolbox HEVC hardware acceleration", "INFO")
+            elif settings["video_codec"] in ["libx264", "libx265"] and hw_accel["h264_encoder"]:
+                video_codec = hw_accel["h264_encoder"]
+                use_hardware = True
+                self.log("🚀 Using VideoToolbox H.264 hardware acceleration", "INFO")
+            else:
+                self.log(f"🔧 Hardware acceleration not optimal for {settings['video_codec']}, using software", "INFO")
+        else:
+            self.log("🔧 Using software encoding", "INFO")
+        
+        # Video codec settings
+        cmd.extend(["-c:v", video_codec])
+        
+        if use_hardware and hw_accel:
+            # VideoToolbox-specific parameters
+            # Use quality parameter instead of CRF for VideoToolbox
+            quality_value = settings.get("crf", 23)
+            # Convert CRF to VideoToolbox quality scale (lower = better quality)
+            # CRF 18-28 maps roughly to q:v 30-70
+            vt_quality = max(30, min(70, int(18 + (quality_value - 18) * 2.6)))
+            cmd.extend([hw_accel["quality_param"], str(vt_quality)])
+            
+            self.log(f"🎛️  VideoToolbox quality: {vt_quality} (from CRF {quality_value})", "DEBUG")
+            
+            # Handle 10-bit content for VideoToolbox
+            if settings["preserve_10bit"]:
+                video_stream = next((s for s in original_info["streams"] if s["codec_type"] == "video"), None)
+                if video_stream and "pix_fmt" in video_stream and "10" in video_stream["pix_fmt"]:
+                    cmd.extend(["-pix_fmt", hw_accel["pixel_format_10bit"]])
+                    self.log("🎨 Using 10-bit pixel format for VideoToolbox", "DEBUG")
+            
+            # VideoToolbox doesn't use preset in the same way
+            self.log(f"🔧 VideoToolbox encoder configured", "DEBUG")
+            
+        else:
+            # Software encoding parameters
+            cmd.extend(["-preset", settings["preset"]])
+            cmd.extend(["-crf", str(settings["crf"])])
+            
+            # Preserve 10-bit if specified for software encoding
+            if settings["preserve_10bit"]:
+                video_stream = next((s for s in original_info["streams"] if s["codec_type"] == "video"), None)
+                if video_stream and "pix_fmt" in video_stream:
+                    if "10" in video_stream["pix_fmt"]:
+                        cmd.extend(["-pix_fmt", "yuv420p10le"])
         
         # Audio - copy without reencoding to preserve quality
         cmd.extend(["-c:a", "copy"])
@@ -996,15 +1135,20 @@ class VideoCompressor:
             cmd.extend(["-map_metadata", "0"])
             cmd.extend(["-movflags", "+faststart"])
         
-        # Calculate target bitrate if specified
-        if "target_bitrate_reduction" in settings:
+        # Calculate target bitrate if specified (only for software encoding)
+        if "target_bitrate_reduction" in settings and not use_hardware:
             original_bitrate = self.get_original_bitrate(original_info)
             if original_bitrate:
                 target_bitrate = int(original_bitrate * settings["target_bitrate_reduction"])
                 cmd.extend(["-b:v", f"{target_bitrate}k"])
-                self.log(f"Target bitrate: {target_bitrate}k (reduced from {original_bitrate}k)")
+                self.log(f"📊 Target bitrate: {target_bitrate}k (reduced from {original_bitrate}k)", "DEBUG")
         
         cmd.append(str(output_path))
+        
+        # Log the encoding method being used
+        encoder_info = f"VideoToolbox {video_codec}" if use_hardware else f"Software {video_codec}"
+        self.log(f"🎬 Encoder: {encoder_info}", "INFO")
+        
         return cmd
     
     def get_original_bitrate(self, video_info):
