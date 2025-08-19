@@ -20,7 +20,7 @@ def create_interface():
             return {}
     
     def test_ffmpeg_connection():
-        """Test FFmpeg installation."""
+        """Test FFmpeg installation and hardware acceleration."""
         try:
             compressor = VideoCompressor()
             ffmpeg_path = compressor.config["ffmpeg_path"]
@@ -30,9 +30,49 @@ def create_interface():
             result = subprocess.run([ffmpeg_path, "-version"], 
                                     capture_output=True, text=True, timeout=10)
             
+            output = ""
             if result.returncode == 0:
                 version_line = result.stdout.split('\n')[0]
-                return f"✅ **FFmpeg Connection Successful!**\n\n**Path:** {ffmpeg_path}\n**Version:** {version_line}\n**Status:** Ready for compression"
+                output += f"✅ **FFmpeg Connection Successful!**\n\n**Path:** {ffmpeg_path}\n**Version:** {version_line}\n"
+                
+                # Test hardware acceleration
+                output += "\n## 🚀 Hardware Acceleration Test\n\n"
+                hw_accel = compressor.detect_hardware_acceleration()
+                
+                if hw_accel:
+                    output += f"✅ **VideoToolbox Hardware Acceleration Available!**\n\n"
+                    output += f"**Type:** {hw_accel['type']}\n"
+                    output += f"**H.264 Encoder:** {hw_accel['h264_encoder']}\n"
+                    if hw_accel['hevc_encoder']:
+                        output += f"**HEVC Encoder:** {hw_accel['hevc_encoder']}\n"
+                    else:
+                        output += f"**HEVC Encoder:** ❌ Not available\n"
+                    output += f"**Quality Parameter:** {hw_accel['quality_param']}\n"
+                    output += f"**10-bit Format:** {hw_accel['pixel_format_10bit']}\n"
+                    output += f"\n**Status:** 🚀 Hardware acceleration will be used automatically when available\n"
+                else:
+                    import platform
+                    processor = platform.processor().lower()
+                    machine = platform.machine().lower()
+                    is_apple_silicon = "arm" in processor or "arm64" in machine
+                    
+                    if is_apple_silicon:
+                        output += f"⚠️ **Apple Silicon detected but VideoToolbox not available**\n\n"
+                        output += f"**Processor:** {processor}\n"
+                        output += f"**Machine:** {machine}\n"
+                        output += f"**Status:** Will fall back to software encoding\n"
+                    else:
+                        output += f"ℹ️ **Software encoding will be used**\n\n"
+                        output += f"**Processor:** {processor}\n"
+                        output += f"**Machine:** {machine}\n"
+                        output += f"**Reason:** Not Apple Silicon or hardware acceleration disabled\n"
+                
+                # Check configuration
+                enable_hw = compressor.config.get("compression_settings", {}).get("enable_hardware_acceleration", True)
+                output += f"\n**Hardware Acceleration Config:** {'✅ Enabled' if enable_hw else '❌ Disabled'}\n"
+                
+                output += f"\n**Overall Status:** Ready for compression"
+                return output
             else:
                 return f"❌ **FFmpeg Test Failed**\n\n**Path:** {ffmpeg_path}\n**Error:** {result.stderr}"
                 
@@ -98,7 +138,7 @@ def create_interface():
     
     def process_videos_ui(file_paths_input, video_files, dry_run, 
                          target_bitrate_reduction, preserve_10bit, preserve_metadata,
-                         video_codec, preset, crf, min_free_space_gb, progress=gr.Progress()):
+                         video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb, progress=gr.Progress()):
         """Process videos through UI."""
         
         try:
@@ -110,6 +150,7 @@ def create_interface():
             config["compression_settings"]["video_codec"] = video_codec
             config["compression_settings"]["preset"] = preset
             config["compression_settings"]["crf"] = int(crf)
+            config["compression_settings"]["enable_hardware_acceleration"] = enable_hardware_acceleration
             config["safety_settings"]["min_free_space_gb"] = min_free_space_gb
             
             # Save temporary config
@@ -203,6 +244,7 @@ def create_interface():
 - **Codec:** {video_codec}
 - **Preset:** {preset}
 - **CRF:** {crf}
+- **Hardware Acceleration:** {'🚀 Enabled' if enable_hardware_acceleration else '❌ Disabled'}
 - **Preserve 10-bit:** {'✅' if preserve_10bit else '❌'}
 - **Preserve Metadata:** {'✅' if preserve_metadata else '❌'}
 """
@@ -405,6 +447,12 @@ def create_interface():
                 )
             
             with gr.Row():
+                enable_hardware_acceleration = gr.Checkbox(
+                    value=compression_settings.get("enable_hardware_acceleration", True),
+                    label="🚀 Hardware Acceleration",
+                    info="Use VideoToolbox on Apple Silicon (automatically detected)"
+                )
+                
                 preserve_10bit = gr.Checkbox(
                     value=compression_settings.get("preserve_10bit", True),
                     label="Preserve 10-bit Color",
@@ -465,7 +513,7 @@ def create_interface():
             inputs=[
                 file_paths_input, video_input, dry_run,
                 target_bitrate_reduction, preserve_10bit, preserve_metadata,
-                video_codec, preset, crf, min_free_space_gb
+                video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb
             ],
             outputs=[results_output]
         )

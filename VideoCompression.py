@@ -790,7 +790,9 @@ class VideoCompressor:
         # Add progress output - use stderr and stats for better real-time updates
         cmd.extend(["-stats", "-loglevel", "info"])
         
-        self.log(f"FFmpeg command: {' '.join(cmd)}")
+        self.log(f"🎬 FFmpeg command preview: {' '.join(cmd[:8])}...", "INFO")
+        self.log(f"📝 Full command logged to DEBUG level", "DEBUG")
+        self.log(f"Full FFmpeg command: {' '.join(cmd)}", "DEBUG")
         
         # Start compression with progress monitoring
         start_time = time.time()
