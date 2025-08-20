@@ -44,3 +44,8 @@ secrets.json
 # Test files
 test_files/
 test_videos/
+
+# Prevent accidental redirection files and artifacts
+*:
+*GB:*
+*.artifact
