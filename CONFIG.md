@@ -221,6 +221,19 @@ This document provides detailed explanations for all configuration settings in `
 - Avoids space issues on different drives
 - **Recommended:** Keep this `true`
 
+### `ui_callback_interval_seconds`
+**Type:** Float  
+**Default:** `0.5`  
+**Description:** Minimum time interval (seconds) between UI progress updates to prevent callback spam.
+
+**Recommendations:**
+- `0.1` - Very responsive UI, may cause performance overhead
+- `0.5` - Good balance of responsiveness and performance (recommended)
+- `1.0` - Less frequent updates, lower overhead
+- `2.0` - Minimal updates, best for slow systems
+
+**Note:** This prevents excessive UI updates during rapid progress changes while maintaining responsive feedback.
+
 ---
 
 ## Segmentation Settings
@@ -374,7 +387,8 @@ Total segments size differs from original by more than this percentage.
     "progress_update_interval": 10,
     "hash_chunk_size_mb": 5,
     "extended_timeouts": true,
-    "use_same_filesystem": true
+    "use_same_filesystem": true,
+    "ui_callback_interval_seconds": 0.5
   },
   "logging_settings": {
     "max_log_files": 5,

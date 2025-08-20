@@ -24,7 +24,7 @@ from multiprocessing import cpu_count
 class ProgressAggregator:
     """Thread-safe progress aggregator for complex video processing workflows."""
     
-    def __init__(self):
+    def __init__(self, config=None):
         self._lock = threading.RLock()
         self._workers = {}  # worker_id -> worker_info
         self._start_time = time.time()
@@ -32,6 +32,13 @@ class ProgressAggregator:
         self._processed_bytes = 0
         self._callback = None
         self._notifying = False  # Prevent recursion in callback notifications
+        self._last_callback_time = 0  # Throttle callback frequency
+        
+        # Get callback interval from config or use default
+        if config and 'large_file_settings' in config:
+            self._callback_interval = config['large_file_settings'].get('ui_callback_interval_seconds', 0.5)
+        else:
+            self._callback_interval = 0.5  # Default fallback
         
     def register_worker(self, worker_id, task_name, file_size_bytes=0, segment_info=None):
         """Register a new worker/task with the aggregator."""
@@ -141,6 +148,9 @@ class ProgressAggregator:
                         worker['eta_seconds'] = float(calculated_eta) if isinstance(calculated_eta, (int, float)) else 0.0
                     except (TypeError, ValueError, ZeroDivisionError):
                         worker['eta_seconds'] = 0.0
+            
+            # Notify callback after any progress update to keep UI responsive
+            self.notify_callback()
     
     def get_aggregate_progress(self):
         """Get overall progress across all workers."""
@@ -208,10 +218,14 @@ class ProgressAggregator:
             self._callback = callback
     
     def notify_callback(self):
-        """Notify the callback with current progress."""
+        """Notify the callback with current progress, respecting throttling interval."""
         with self._lock:
-            if self._callback and not self._notifying:
+            current_time = time.time()
+            # Check if enough time has passed since last callback
+            if (self._callback and not self._notifying and 
+                (current_time - self._last_callback_time) >= self._callback_interval):
                 self._notifying = True
+                self._last_callback_time = current_time
                 try:
                     progress_data = self.get_aggregate_progress()
                     self._callback(progress_data)
@@ -252,7 +266,7 @@ class VideoCompressor:
         self.setup_enhanced_logging()
         self.processed_files = []
         self.failed_files = []
-        self.progress_aggregator = ProgressAggregator()
+        self.progress_aggregator = ProgressAggregator(self.config)
         
     def load_config(self, config_path):
         """Load configuration from JSON file."""
