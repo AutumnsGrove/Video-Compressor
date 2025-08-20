@@ -1823,7 +1823,13 @@ class VideoCompressor:
             # Progress callback wrapper for segmentation workflow
             def segmentation_progress_callback(parallel_progress):
                 # Calculate overall progress: 25% for segmentation + 65% for compression + 10% for merge
-                overall_progress = 0.25 + (parallel_progress * 0.65)
+                # Handle both dict (from ProgressAggregator) and float formats
+                if isinstance(parallel_progress, dict):
+                    progress_value = parallel_progress.get('overall_progress', 0.0)
+                else:
+                    progress_value = float(parallel_progress) if parallel_progress is not None else 0.0
+                
+                overall_progress = 0.25 + (progress_value * 0.65)
                 if progress_callback:
                     progress_callback(overall_progress)
             

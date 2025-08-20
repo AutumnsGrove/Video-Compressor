@@ -19,8 +19,8 @@
     "delete_original_after_compression": true
   },
   "large_file_settings": {
-    "threshold_gb": 10,
-    "segmentation_threshold_gb": 10,
+    "threshold_gb": 5,
+    "segmentation_threshold_gb": 5,
     "enhanced_monitoring": true,
     "progress_update_interval": 10,
     "hash_chunk_size_mb": 5,
@@ -29,8 +29,8 @@
     "ui_callback_interval_seconds": 0.5
   },
   "logging_settings": {
-    "max_log_files": 5,
-    "max_log_size_mb": 10,
+    "max_log_files": 10,
+    "max_log_size_mb": 20,
     "console_level": "INFO",
     "file_level": "DEBUG"
   },
@@ -43,8 +43,8 @@
     "segment_timeout_hours": 1
   },
   "segmentation_settings": {
-    "segment_duration_seconds": 600,
-    "duration_threshold_minutes": 15,
+    "segment_duration_seconds": 300,
+    "duration_threshold_minutes": 5,
     "segmentation_timeout_minutes_per_gb": 1,
     "min_segmentation_timeout_minutes": 5,
     "size_difference_warning_percent": 5,
