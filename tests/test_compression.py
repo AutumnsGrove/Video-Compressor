@@ -10,6 +10,9 @@ import json
 import tempfile
 import subprocess
 from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from VideoCompression import VideoCompressor
 
 def create_test_video(output_path, duration=5, resolution="320x240"):

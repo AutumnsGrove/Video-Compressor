@@ -44,6 +44,10 @@ secrets.json
 # Test files
 test_files/
 test_videos/
+tests/test_gradio_demo/
+tests/*.mp4
+tests/*.mov
+tests/*.avi
 
 # Prevent accidental redirection files and artifacts
 *:

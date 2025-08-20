@@ -2136,7 +2136,7 @@ class VideoCompressor:
         return total_duration
     
     def process_file_list(self, file_list, dry_run=False, batch_progress_callback=None):
-        """Process a list of files with comprehensive reporting."""
+        """Process a list of files with comprehensive reporting and enhanced progress tracking."""
         self.log(f"\n{'='*60}")
         self.log(f"BATCH PROCESSING {'(DRY RUN)' if dry_run else ''}")
         self.log(f"Files to process: {len(file_list)}")
@@ -2161,6 +2161,76 @@ class VideoCompressor:
             estimated_completion = datetime.now() + total_estimated_time
             self.log(f"Estimated completion: {estimated_completion.strftime('%Y-%m-%d %H:%M:%S')}")
         
+        # Setup progress aggregator for batch processing
+        self.progress_aggregator = ProgressAggregator()
+        if batch_progress_callback:
+            self.progress_aggregator.set_callback(batch_progress_callback)
+        
+        # Register all files with progress aggregator
+        for i, file_path in enumerate(file_list):
+            if Path(file_path).exists():
+                original_size = os.path.getsize(file_path)
+                worker_id = f"batch_file_{i}"
+                task_name = f"Processing {Path(file_path).name}"
+                
+                # Check if file would be segmented to add that info
+                segment_info = None
+                if self.should_segment_file(file_path):
+                    # Estimate segments for dry run display
+                    video_info = self.get_video_info(file_path)
+                    if video_info:
+                        duration = self.get_video_duration(video_info)
+                        segment_duration = self.config.get("large_file_settings", {}).get("segment_duration_minutes", 10) * 60
+                        estimated_segments = max(1, int(duration / segment_duration))
+                        segment_info = {'current': 0, 'total': estimated_segments, 'duration': duration}
+                
+                self.progress_aggregator.register_worker(worker_id, task_name, original_size, segment_info)
+        
+        # Enhanced dry run simulation with worker allocation
+        if dry_run:
+            self.log("\n🧪 [DRY RUN] Enhanced Processing Simulation:")
+            large_files = [f for f in file_list if Path(f).exists() and self.should_segment_file(f)]
+            small_files = [f for f in file_list if Path(f).exists() and not self.should_segment_file(f)]
+            
+            if large_files:
+                self.log(f"🔥 Large files detected ({len(large_files)}):")
+                for file_path in large_files:
+                    file_size_gb = os.path.getsize(file_path) / (1024**3)
+                    video_info = self.get_video_info(file_path)
+                    if video_info:
+                        duration = self.get_video_duration(video_info)
+                        segment_duration = self.config.get("large_file_settings", {}).get("segment_duration_minutes", 10) * 60
+                        estimated_segments = max(1, int(duration / segment_duration))
+                        self.log(f"   📁 {Path(file_path).name} ({file_size_gb:.1f}GB) → {estimated_segments} segments")
+                        
+                        # Simulate worker allocation for segments
+                        if hasattr(self, 'segment_parallel') and self.segment_parallel:
+                            max_workers = min(self.max_concurrent_jobs, estimated_segments)
+                            self.log(f"      🔧 Would use {max_workers} parallel workers for segments")
+                        else:
+                            self.log(f"      🔧 Would process segments sequentially")
+            
+            if small_files:
+                max_workers = min(self.max_concurrent_jobs if hasattr(self, 'max_concurrent_jobs') else 1, len(small_files))
+                self.log(f"📄 Small files ({len(small_files)}) → {max_workers} parallel workers")
+            
+            # Simulate progress updates for demo
+            total_workers = len(file_list)
+            self.log(f"🚀 Total worker allocation: {total_workers} tasks")
+            
+            # Trigger progress callback with simulated data
+            if batch_progress_callback:
+                simulated_progress = {
+                    'overall_progress': 0.0,
+                    'active_workers': total_workers,
+                    'total_workers': total_workers,
+                    'throughput_mbps': 0.0,
+                    'eta_seconds': int(total_estimated_time.total_seconds()) if total_estimated_time else 0
+                }
+                batch_progress_callback(simulated_progress)
+            
+            return
+        
         # Process each file
         start_time = time.time()
         total_space_saved = 0
@@ -2177,19 +2247,24 @@ class VideoCompressor:
                 if video_info:
                     file_duration = self.get_video_duration(video_info)
             
-            # Create progress callback for this file
+            # Enhanced progress callback that integrates with ProgressAggregator
+            worker_id = f"batch_file_{i-1}"  # 0-indexed for consistency
+            
             def file_progress_callback(file_progress):
-                if batch_progress_callback and total_video_duration > 0:
-                    # Calculate overall progress
-                    current_file_contribution = (file_progress * file_duration)
-                    overall_progress = (processed_duration + current_file_contribution) / total_video_duration
-                    batch_progress_callback(overall_progress, f"File {i}/{len(file_list)}: {Path(file_path).name} ({file_progress*100:.1f}%)")
+                # Update the progress aggregator
+                self.progress_aggregator.update_worker_progress(worker_id, file_progress)
+                # Notify the callback with enhanced progress data
+                if batch_progress_callback:
+                    self.progress_aggregator.notify_callback()
             
             success, message = self.process_file(file_path, dry_run, file_progress_callback)
             
             if success:
                 self.processed_files.append(file_path)
                 processed_duration += file_duration
+                # Mark worker as completed
+                self.progress_aggregator.complete_worker(worker_id)
+                
                 if not dry_run and Path(file_path).parent.exists():
                     # Calculate space saved
                     compressed_files = list(Path(file_path).parent.glob(f"{Path(file_path).stem}_compressed*"))
@@ -2200,6 +2275,8 @@ class VideoCompressor:
             else:
                 self.failed_files.append((file_path, message))
                 self.log(f"❌ FAILED: {message}", "ERROR")
+                # Mark worker as failed
+                self.progress_aggregator.fail_worker(worker_id, message)
                 
                 # In batch processing, log the failure but continue with other files
                 if not dry_run:
