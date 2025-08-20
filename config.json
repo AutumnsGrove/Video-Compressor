@@ -30,5 +30,19 @@
     "max_log_size_mb": 10,
     "console_level": "INFO",
     "file_level": "DEBUG"
+  },
+  "parallel_processing": {
+    "enabled": true,
+    "max_workers": 4,
+    "max_workers_limit": 16,
+    "segment_parallel": true,
+    "small_file_timeout_hours": 2,
+    "segment_timeout_hours": 1
+  },
+  "segmentation_settings": {
+    "segment_duration_seconds": 600,
+    "duration_threshold_minutes": 60,
+    "size_difference_warning_percent": 5,
+    "merge_size_difference_warning_percent": 10
   }
 }

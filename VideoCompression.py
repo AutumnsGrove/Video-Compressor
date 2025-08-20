@@ -18,6 +18,8 @@ import queue
 import threading
 import re
 import platform
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
 class VideoCompressor:
     def __init__(self, config_path="config.json"):
@@ -56,17 +58,36 @@ class VideoCompressor:
                 },
                 "large_file_settings": {
                     "threshold_gb": 10,
+                    "segmentation_threshold_gb": 10,
                     "enhanced_monitoring": True,
                     "progress_update_interval": 10,
                     "hash_chunk_size_mb": 5,
                     "extended_timeouts": True,
                     "use_same_filesystem": True
                 },
+                "segmentation_settings": {
+                    "segment_duration_seconds": 600,
+                    "duration_threshold_minutes": 60,
+                    "segmentation_timeout_minutes_per_gb": 1,
+                    "min_segmentation_timeout_minutes": 5,
+                    "size_difference_warning_percent": 5
+                },
+                "timeout_settings": {
+                    "small_file_timeout_hours": 2,
+                    "segment_timeout_hours": 1,
+                    "merge_size_difference_warning_percent": 10,
+                    "segment_progress_log_interval_seconds": 30
+                },
                 "logging_settings": {
                     "max_log_files": 5,
                     "max_log_size_mb": 10,
                     "console_level": "INFO",
                     "file_level": "DEBUG"
+                },
+                "parallel_processing": {
+                    "enabled": True,
+                    "max_workers": 4,
+                    "segment_parallel": True
                 }
             }
             with open(config_path, 'w') as f:
@@ -782,6 +803,10 @@ class VideoCompressor:
         if not original_info:
             return False, "Cannot read original video information"
         
+        # Check if file should be segmented for large file processing
+        if self.should_segment_file(input_path):
+            return self.compress_video_with_segmentation(input_path, output_path, progress_callback)
+        
         # Get video duration for progress calculation
         video_duration = self.get_video_duration(original_info)
         
@@ -1153,6 +1178,521 @@ class VideoCompressor:
         
         return cmd
     
+    def should_segment_file(self, file_path):
+        """Check if file should be segmented based on size and duration thresholds."""
+        try:
+            # Get configured thresholds from config with defaults
+            segmentation_threshold_gb = self.config.get("large_file_settings", {}).get("segmentation_threshold_gb", 10)
+            
+            # Check file size
+            file_size = os.path.getsize(file_path)
+            file_size_gb = file_size / (1024**3)
+            
+            self.log(f"🔍 Checking segmentation criteria for {Path(file_path).name}:", "DEBUG")
+            self.log(f"   File size: {file_size_gb:.2f}GB (threshold: {segmentation_threshold_gb}GB)", "DEBUG")
+            
+            # Size check
+            size_exceeds = file_size_gb > segmentation_threshold_gb
+            
+            # Duration check
+            video_info = self.get_video_info(file_path)
+            if not video_info:
+                self.log(f"   Cannot get video info - defaulting to size-only check", "WARNING")
+                return size_exceeds
+            
+            duration_seconds = self.get_video_duration(video_info)
+            duration_minutes = duration_seconds / 60
+            
+            self.log(f"   Duration: {duration_minutes:.1f} minutes ({duration_seconds:.1f}s)", "DEBUG")
+            
+            # Duration threshold from config (default: 60 minutes = 3600 seconds)
+            duration_threshold_minutes = self.config.get("segmentation_settings", {}).get("duration_threshold_minutes", 60)
+            duration_threshold_seconds = duration_threshold_minutes * 60
+            duration_exceeds = duration_seconds > duration_threshold_seconds
+            
+            # Decision: segment if BOTH size AND duration exceed thresholds
+            should_segment = size_exceeds and duration_exceeds
+            
+            self.log(f"   Size exceeds threshold: {size_exceeds}", "DEBUG")
+            self.log(f"   Duration exceeds threshold: {duration_exceeds}", "DEBUG")
+            self.log(f"   Should segment: {should_segment}", "INFO")
+            
+            return should_segment
+            
+        except Exception as e:
+            self.log(f"Error checking segmentation criteria: {e}", "ERROR")
+            return False
+    
+    def segment_video(self, input_path, segment_duration=None):
+        """Segment video into smaller chunks using ffmpeg with stream copy for speed."""
+        if segment_duration is None:
+            segment_duration = self.config.get("segmentation_settings", {}).get("segment_duration_seconds", 600)
+            
+        self.log(f"📁 Starting video segmentation: {Path(input_path).name}", "INFO")
+        self.log(f"   Segment duration: {segment_duration} seconds ({segment_duration//60} minutes)", "INFO")
+        
+        input_path = Path(input_path)
+        
+        # Create segments directory in same filesystem as input for efficiency
+        if self.config.get("large_file_settings", {}).get("use_same_filesystem", True):
+            segments_dir = input_path.parent / ".video_segments_temp"
+        else:
+            segments_dir = Path(self.config["temp_dir"]) / "video_segments"
+        
+        segments_dir.mkdir(exist_ok=True)
+        self.log(f"   Segments directory: {segments_dir}", "DEBUG")
+        
+        # Generate segment filename pattern
+        base_name = input_path.stem
+        segment_pattern = segments_dir / f"{base_name}_segment_%03d{input_path.suffix}"
+        
+        # Build ffmpeg segmentation command
+        cmd = [
+            self.config["ffmpeg_path"],
+            "-i", str(input_path),
+            "-c", "copy",  # Stream copy for maximum speed
+            "-map", "0",   # Copy all streams
+            "-segment_time", str(segment_duration),
+            "-f", "segment",
+            "-reset_timestamps", "1",  # Reset timestamps for each segment
+            str(segment_pattern)
+        ]
+        
+        self.log(f"🎬 Segmentation command: {' '.join(cmd[:8])}...", "INFO")
+        self.log(f"Full segmentation command: {' '.join(cmd)}", "DEBUG")
+        
+        try:
+            # Run segmentation with timeout based on file size and config
+            file_size_gb = os.path.getsize(input_path) / (1024**3)
+            
+            # Get timeout settings from config
+            timeout_minutes_per_gb = self.config.get("segmentation_settings", {}).get("segmentation_timeout_minutes_per_gb", 1)
+            min_timeout_minutes = self.config.get("segmentation_settings", {}).get("min_segmentation_timeout_minutes", 5)
+            
+            timeout = max(min_timeout_minutes * 60, int(file_size_gb * timeout_minutes_per_gb * 60))  # Convert to seconds
+            
+            self.log(f"⏱️  Starting segmentation (timeout: {timeout}s)...", "INFO")
+            start_time = time.time()
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            
+            end_time = time.time()
+            duration = timedelta(seconds=int(end_time - start_time))
+            
+            if result.returncode != 0:
+                error_msg = f"FFmpeg segmentation failed: {result.stderr}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return None
+            
+            # Find all created segments
+            segment_files = sorted(segments_dir.glob(f"{base_name}_segment_*{input_path.suffix}"))
+            
+            if not segment_files:
+                error_msg = "No segment files were created"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return None
+            
+            self.log(f"✅ Segmentation completed in {duration}", "INFO")
+            self.log(f"   Created {len(segment_files)} segments", "INFO")
+            
+            # Log segment details
+            total_segments_size = 0
+            for i, segment in enumerate(segment_files, 1):
+                segment_size = segment.stat().st_size
+                total_segments_size += segment_size
+                self.log(f"   Segment {i}: {segment.name} ({segment_size / (1024**2):.1f}MB)", "DEBUG")
+            
+            original_size = os.path.getsize(input_path)
+            size_difference = abs(total_segments_size - original_size) / original_size * 100
+            
+            self.log(f"   Total segments size: {total_segments_size / (1024**3):.2f}GB", "INFO")
+            self.log(f"   Original file size: {original_size / (1024**3):.2f}GB", "INFO")
+            self.log(f"   Size difference: {size_difference:.2f}%", "DEBUG")
+            
+            # Get configurable size difference warning threshold
+            size_diff_warning_percent = self.config.get("segmentation_settings", {}).get("size_difference_warning_percent", 5)
+            
+            if size_difference > size_diff_warning_percent:
+                self.log(f"⚠️  Large size difference detected ({size_difference:.1f}% > {size_diff_warning_percent}%) - segments may have issues", "WARNING")
+            
+            return [str(segment) for segment in segment_files]
+            
+        except subprocess.TimeoutExpired:
+            error_msg = f"Segmentation timed out after {timeout} seconds"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return None
+        except Exception as e:
+            error_msg = f"Segmentation error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return None
+    
+    def merge_compressed_segments(self, segment_paths, output_path):
+        """Merge compressed segments back into a single file using ffmpeg concat."""
+        self.log(f"🔗 Starting segment merging: {len(segment_paths)} segments", "INFO")
+        self.log(f"   Output: {output_path}", "DEBUG")
+        
+        if not segment_paths:
+            return False, "No segments provided for merging"
+        
+        output_path = Path(output_path)
+        
+        # Create concat file list for ffmpeg in the same directory as segments
+        segments_dir = Path(segment_paths[0]).parent
+        concat_file = segments_dir / f"concat_list_{output_path.stem}.txt"
+        
+        try:
+            # Write concat file
+            with open(concat_file, 'w') as f:
+                for segment_path in segment_paths:
+                    # Ensure segment exists
+                    if not Path(segment_path).exists():
+                        return False, f"Segment file not found: {segment_path}"
+                    
+                    # Write absolute path to ensure ffmpeg can find files
+                    f.write(f"file '{Path(segment_path).absolute()}'\n")
+            
+            self.log(f"📝 Created concat list: {concat_file}", "DEBUG")
+            
+            # Build ffmpeg concat command
+            cmd = [
+                self.config["ffmpeg_path"],
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_file),
+                "-c", "copy",  # Stream copy for speed
+                str(output_path)
+            ]
+            
+            self.log(f"🎬 Merge command: {' '.join(cmd)}", "DEBUG")
+            
+            # Run merging with progress monitoring
+            start_time = time.time()
+            
+            # Calculate total size for progress estimation
+            total_segments_size = sum(os.path.getsize(segment) for segment in segment_paths)
+            
+            self.log(f"⏱️  Starting merge of {total_segments_size / (1024**3):.2f}GB...", "INFO")
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True
+            )
+            
+            end_time = time.time()
+            duration = timedelta(seconds=int(end_time - start_time))
+            
+            if result.returncode != 0:
+                error_msg = f"FFmpeg merge failed: {result.stderr}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return False, error_msg
+            
+            self.log(f"✅ Merge completed in {duration}", "INFO")
+            
+            # Verify merged file
+            if not output_path.exists():
+                return False, "Merged file was not created"
+            
+            merged_size = output_path.stat().st_size
+            if merged_size == 0:
+                return False, "Merged file is empty"
+            
+            # Compare sizes (allow some variance due to container overhead)
+            size_difference = abs(merged_size - total_segments_size) / total_segments_size * 100
+            
+            self.log(f"📊 Merge verification:", "INFO")
+            self.log(f"   Merged file size: {merged_size / (1024**3):.2f}GB", "INFO")
+            self.log(f"   Expected size: {total_segments_size / (1024**3):.2f}GB", "DEBUG")
+            self.log(f"   Size difference: {size_difference:.2f}%", "DEBUG")
+            
+            if size_difference > 10:  # More than 10% difference might indicate an issue
+                self.log(f"⚠️  Large size difference in merge - may indicate issues", "WARNING")
+            
+            # Test file integrity
+            self.log(f"🔍 Testing merged file integrity...", "INFO")
+            video_info = self.get_video_info(output_path)
+            if not video_info:
+                return False, "Merged file cannot be read by ffprobe"
+            
+            # Quick playability test
+            test_cmd = [
+                self.config["ffmpeg_path"],
+                "-v", "error",
+                "-i", str(output_path),
+                "-t", "5",
+                "-f", "null", "-"
+            ]
+            
+            test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=30)
+            if test_result.returncode != 0:
+                return False, f"Merged file failed playability test: {test_result.stderr}"
+            
+            self.log(f"✅ Merged file integrity verified", "INFO")
+            
+            return True, "Segments merged successfully"
+            
+        except Exception as e:
+            error_msg = f"Merge error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+        finally:
+            # Clean up concat file
+            try:
+                if concat_file.exists():
+                    concat_file.unlink()
+                    self.log(f"🧹 Cleaned up concat file: {concat_file}", "DEBUG")
+            except Exception as e:
+                self.log(f"⚠️  Failed to clean up concat file: {e}", "WARNING")
+    
+    def compress_video_with_segmentation(self, input_path, output_path, progress_callback=None):
+        """Compress large video using segmentation approach: segment → compress each → merge."""
+        self.log(f"🎯 LARGE FILE SEGMENTATION WORKFLOW", "INFO")
+        self.log(f"   Input: {Path(input_path).name}", "INFO")
+        self.log(f"   This file will be segmented for optimal processing", "INFO")
+        
+        input_path = Path(input_path)
+        output_path = Path(output_path)
+        
+        # Step 1: Segment the original video
+        self.log(f"📁 Step 1: Segmenting large video file...", "INFO")
+        segment_paths = self.segment_video(input_path)
+        if not segment_paths:
+            return False, "Failed to segment video file"
+        
+        self.log(f"✅ Created {len(segment_paths)} segments", "INFO")
+        
+        compressed_segments = []
+        total_segments = len(segment_paths)
+        
+        try:
+            # Step 2: Compress each segment individually
+            self.log(f"🎬 Step 2: Compressing {total_segments} segments...", "INFO")
+            
+            for i, segment_path in enumerate(segment_paths, 1):
+                segment_name = Path(segment_path).name
+                self.log(f"   Processing segment {i}/{total_segments}: {segment_name}", "INFO")
+                
+                # Create compressed segment output path
+                segment_output = Path(segment_path).parent / f"{Path(segment_path).stem}_compressed{Path(segment_path).suffix}"
+                
+                # Progress callback for segment compression
+                def segment_progress_callback(segment_progress):
+                    if progress_callback:
+                        # Calculate overall progress: segmentation done (10%), current segment compression
+                        segment_weight = 0.8 / total_segments  # 80% for all compressions
+                        overall_progress = 0.1 + (i - 1) * segment_weight + segment_progress * segment_weight
+                        progress_callback(overall_progress)
+                
+                # Compress this segment (using existing single-file logic)
+                success, message = self.compress_single_segment(segment_path, segment_output, segment_progress_callback)
+                
+                if not success:
+                    # Clean up any partial segments
+                    self.cleanup_segment_files(segment_paths, compressed_segments)
+                    return False, f"Failed to compress segment {i}: {message}"
+                
+                compressed_segments.append(str(segment_output))
+                
+                # Clean up original segment after compression
+                try:
+                    Path(segment_path).unlink()
+                    self.log(f"   🧹 Cleaned up original segment: {segment_name}", "DEBUG")
+                except Exception as e:
+                    self.log(f"   ⚠️  Failed to clean up segment {segment_name}: {e}", "WARNING")
+            
+            # Step 3: Merge compressed segments
+            self.log(f"🔗 Step 3: Merging {len(compressed_segments)} compressed segments...", "INFO")
+            
+            # Update progress for merging phase
+            if progress_callback:
+                progress_callback(0.9)  # 90% complete, starting merge
+            
+            success, message = self.merge_compressed_segments(compressed_segments, output_path)
+            if not success:
+                self.cleanup_segment_files([], compressed_segments)
+                return False, f"Failed to merge segments: {message}"
+            
+            # Step 4: Verify final merged file
+            self.log(f"🔍 Step 4: Verifying merged file integrity...", "INFO")
+            
+            # Get original video info for comparison
+            original_info = self.get_video_info(input_path)
+            integrity_ok, integrity_msg = self.verify_file_integrity(output_path, original_info)
+            
+            if not integrity_ok:
+                self.cleanup_segment_files([], compressed_segments)
+                return False, f"Final file verification failed: {integrity_msg}"
+            
+            # Step 5: Clean up segment files
+            self.log(f"🧹 Step 5: Cleaning up temporary segment files...", "INFO")
+            self.cleanup_segment_files([], compressed_segments)
+            
+            # Final progress update
+            if progress_callback:
+                progress_callback(1.0)
+            
+            self.log(f"✅ SEGMENTATION WORKFLOW COMPLETE", "INFO")
+            self.log(f"   Large file successfully processed using segmentation", "INFO")
+            
+            return True, "Large file compressed successfully using segmentation"
+            
+        except Exception as e:
+            error_msg = f"Segmentation workflow error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            
+            # Clean up on error
+            self.cleanup_segment_files(segment_paths, compressed_segments)
+            return False, error_msg
+    
+    def compress_single_segment(self, input_path, output_path, progress_callback=None):
+        """Compress a single segment using the existing compression logic."""
+        # Get segment video info
+        original_info = self.get_video_info(input_path)
+        if not original_info:
+            return False, "Cannot read segment video information"
+        
+        # Get video duration for progress calculation
+        video_duration = self.get_video_duration(original_info)
+        
+        # Build ffmpeg command
+        cmd = self.build_ffmpeg_command(input_path, output_path, original_info)
+        cmd.extend(["-stats", "-loglevel", "info"])
+        
+        self.log(f"      🎬 Compressing segment: {Path(input_path).name}", "DEBUG")
+        
+        # Start compression
+        start_time = time.time()
+        
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1
+            )
+            
+            # Simplified progress monitoring for segments
+            progress_queue = queue.Queue(maxsize=50)
+            
+            def monitor_segment_stderr():
+                current_progress = 0.0
+                try:
+                    for line in iter(process.stderr.readline, ''):
+                        if not line:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        # Parse time progress
+                        time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2}\.\d{2})', line)
+                        if time_match and video_duration > 0:
+                            hours, minutes, seconds = time_match.groups()
+                            current_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                            progress_pct = min(current_seconds / video_duration, 1.0)
+                            
+                            if progress_pct > current_progress + 0.02:  # Update every 2%
+                                current_progress = progress_pct
+                                try:
+                                    progress_queue.put(progress_pct, timeout=0.1)
+                                except queue.Full:
+                                    pass
+                except Exception:
+                    pass
+            
+            # Start monitoring
+            monitor_thread = threading.Thread(target=monitor_segment_stderr, daemon=True)
+            monitor_thread.start()
+            
+            # Process progress updates
+            last_update_time = time.time()
+            current_progress = 0.0
+            
+            while process.poll() is None:
+                try:
+                    progress_pct = progress_queue.get(timeout=0.5)
+                    current_time = time.time()
+                    
+                    if progress_callback:
+                        progress_callback(progress_pct)
+                    
+                    # Log progress less frequently for segments
+                    if current_time - last_update_time > 30.0:  # Every 30 seconds
+                        self.log(f"      📊 Segment progress: {progress_pct*100:.1f}%", "DEBUG")
+                        last_update_time = current_time
+                        
+                except queue.Empty:
+                    continue
+            
+            # Final callback update
+            if progress_callback:
+                progress_callback(1.0)
+            
+            # Wait for completion
+            process.wait()
+            monitor_thread.join(timeout=5.0)
+            
+            if process.returncode != 0:
+                try:
+                    stderr_output = process.stderr.read() if process.stderr else "No stderr available"
+                except:
+                    stderr_output = "Could not read stderr"
+                
+                error_msg = f"Segment compression failed with return code {process.returncode}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return False, error_msg
+            
+            end_time = time.time()
+            duration = timedelta(seconds=int(end_time - start_time))
+            self.log(f"      ✅ Segment compressed in {duration}", "DEBUG")
+            
+            return True, "Segment compression successful"
+            
+        except Exception as e:
+            error_msg = f"Segment compression error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+    
+    def cleanup_segment_files(self, original_segments=None, compressed_segments=None):
+        """Clean up segment files and directories."""
+        segments_to_clean = []
+        
+        if original_segments:
+            segments_to_clean.extend(original_segments)
+        if compressed_segments:
+            segments_to_clean.extend(compressed_segments)
+        
+        # Clean up individual segment files
+        for segment_path in segments_to_clean:
+            try:
+                segment_file = Path(segment_path)
+                if segment_file.exists():
+                    segment_file.unlink()
+                    self.log(f"🧹 Cleaned up segment: {segment_file.name}", "DEBUG")
+            except Exception as e:
+                self.log(f"⚠️  Failed to clean up segment {segment_path}: {e}", "WARNING")
+        
+        # Clean up segment directories
+        segment_dirs_to_check = set()
+        for segment_path in segments_to_clean:
+            segment_dir = Path(segment_path).parent
+            if segment_dir.name in [".video_segments_temp", "video_segments"]:
+                segment_dirs_to_check.add(segment_dir)
+        
+        for segment_dir in segment_dirs_to_check:
+            try:
+                if segment_dir.exists() and not any(segment_dir.iterdir()):
+                    segment_dir.rmdir()
+                    self.log(f"🧹 Cleaned up empty segment directory: {segment_dir}", "DEBUG")
+            except Exception as e:
+                self.log(f"⚠️  Failed to clean up segment directory {segment_dir}: {e}", "WARNING")
+    
     def get_original_bitrate(self, video_info):
         """Extract original video bitrate from video info."""
         try:
@@ -1510,6 +2050,563 @@ class VideoCompressor:
                 if isinstance(handler, (logging.FileHandler, logging.handlers.RotatingFileHandler)):
                     handler.close()
                     self.logger.removeHandler(handler)
+
+class ParallelVideoProcessor(VideoCompressor):
+    """Enhanced video processor with parallel processing capabilities."""
+    
+    def __init__(self, config_path="config.json"):
+        super().__init__(config_path)
+        
+        # Initialize parallel processing settings
+        parallel_config = self.config.get("parallel_processing", {})
+        self.parallel_enabled = parallel_config.get("enabled", True)
+        max_workers_config = parallel_config.get("max_workers", 4)
+        
+        # Determine max concurrent jobs with intelligent defaults
+        cpu_cores = cpu_count()
+        self.max_concurrent_jobs = min(max_workers_config, cpu_cores)
+        
+        # Ensure at least 1 worker but cap at configurable limits
+        max_workers_limit = parallel_config.get("max_workers_limit", 16)
+        self.max_concurrent_jobs = max(1, min(self.max_concurrent_jobs, max_workers_limit))
+        
+        self.segment_parallel = parallel_config.get("segment_parallel", True)
+        
+        self.log(f"🚀 ParallelVideoProcessor initialized", "INFO")
+        self.log(f"   Parallel processing: {'✅ Enabled' if self.parallel_enabled else '❌ Disabled'}", "INFO")
+        self.log(f"   Max concurrent jobs: {self.max_concurrent_jobs} (CPU cores: {cpu_cores})", "INFO")
+        self.log(f"   Segment parallel: {'✅ Enabled' if self.segment_parallel else '❌ Disabled'}", "INFO")
+    
+    def process_segments_parallel(self, segments, output_dir, progress_callback=None):
+        """Process video segments in parallel with comprehensive progress tracking."""
+        if not segments:
+            return [], "No segments provided"
+        
+        if not self.parallel_enabled or len(segments) == 1:
+            # Fall back to sequential processing
+            self.log("📝 Processing segments sequentially (parallel disabled or single segment)", "INFO")
+            return self._process_segments_sequential(segments, output_dir, progress_callback)
+        
+        self.log(f"🔄 PARALLEL SEGMENT PROCESSING", "INFO")
+        self.log(f"   Segments to process: {len(segments)}", "INFO")
+        self.log(f"   Parallel workers: {min(self.max_concurrent_jobs, len(segments))}", "INFO")
+        self.log(f"   Output directory: {output_dir}", "DEBUG")
+        
+        # Prepare progress tracking
+        progress_queue = queue.Queue()
+        completed_segments = []
+        failed_segments = []
+        
+        # Worker function for segment compression
+        def compress_segment_worker(segment_path, segment_index, total_segments):
+            """Worker function to compress a single segment."""
+            worker_id = threading.current_thread().name
+            segment_name = Path(segment_path).name
+            
+            try:
+                self.log(f"🔧 [{worker_id}] Starting segment {segment_index+1}/{total_segments}: {segment_name}", "DEBUG")
+                
+                # Create output path
+                segment_path_obj = Path(segment_path)
+                output_path = Path(output_dir) / f"{segment_path_obj.stem}_compressed{segment_path_obj.suffix}"
+                
+                # Individual segment progress callback
+                def segment_progress(seg_progress):
+                    try:
+                        progress_queue.put({
+                            'type': 'segment_progress',
+                            'segment_index': segment_index,
+                            'progress': seg_progress,
+                            'worker_id': worker_id
+                        }, timeout=0.1)
+                    except queue.Full:
+                        pass  # Skip if queue is full
+                
+                # Compress the segment
+                success, message = self.compress_single_segment(segment_path, output_path, segment_progress)
+                
+                if success:
+                    self.log(f"✅ [{worker_id}] Completed segment {segment_index+1}: {segment_name}", "DEBUG")
+                    result = {
+                        'type': 'segment_complete',
+                        'segment_index': segment_index,
+                        'input_path': segment_path,
+                        'output_path': str(output_path),
+                        'success': True,
+                        'message': message,
+                        'worker_id': worker_id
+                    }
+                else:
+                    self.log(f"❌ [{worker_id}] Failed segment {segment_index+1}: {segment_name} - {message}", "ERROR")
+                    result = {
+                        'type': 'segment_complete',
+                        'segment_index': segment_index,
+                        'input_path': segment_path,
+                        'output_path': None,
+                        'success': False,
+                        'message': message,
+                        'worker_id': worker_id
+                    }
+                
+                try:
+                    progress_queue.put(result, timeout=1.0)
+                except queue.Full:
+                    self.log(f"⚠️  [{worker_id}] Progress queue full, result may be lost", "WARNING")
+                
+                return result
+                
+            except Exception as e:
+                error_msg = f"Worker exception in segment {segment_index+1}: {type(e).__name__}: {e}"
+                self.log(f"❌ [{worker_id}] {error_msg}", "ERROR")
+                
+                result = {
+                    'type': 'segment_complete',
+                    'segment_index': segment_index,
+                    'input_path': segment_path,
+                    'output_path': None,
+                    'success': False,
+                    'message': error_msg,
+                    'worker_id': worker_id
+                }
+                
+                try:
+                    progress_queue.put(result, timeout=1.0)
+                except queue.Full:
+                    pass
+                
+                return result
+        
+        # Start parallel processing with ThreadPoolExecutor
+        actual_workers = min(self.max_concurrent_jobs, len(segments))
+        
+        try:
+            with ThreadPoolExecutor(max_workers=actual_workers, thread_name_prefix="SegmentWorker") as executor:
+                # Submit all segment compression jobs
+                futures = {
+                    executor.submit(compress_segment_worker, segment_path, i, len(segments)): i 
+                    for i, segment_path in enumerate(segments)
+                }
+                
+                self.log(f"🚀 Started {len(futures)} parallel segment compression jobs", "INFO")
+                
+                # Progress tracking variables
+                segment_progress = {i: 0.0 for i in range(len(segments))}
+                completed_count = 0
+                start_time = time.time()
+                last_log_time = start_time
+                
+                # Process results as they complete
+                for future in as_completed(futures):
+                    try:
+                        # Get result with timeout
+                        result = future.result(timeout=3600)  # 1 hour timeout per segment
+                        
+                        if result['success']:
+                            completed_segments.append(result['output_path'])
+                        else:
+                            failed_segments.append((result['input_path'], result['message']))
+                        
+                        completed_count += 1
+                        segment_progress[result['segment_index']] = 1.0
+                        
+                        # Calculate and report overall progress
+                        overall_progress = completed_count / len(segments)
+                        
+                        current_time = time.time()
+                        if current_time - last_log_time > 10.0 or completed_count == len(segments):  # Every 10 seconds or final
+                            elapsed = current_time - start_time
+                            if overall_progress > 0:
+                                eta = (elapsed / overall_progress) * (1 - overall_progress)
+                                eta_str = str(timedelta(seconds=int(eta)))
+                            else:
+                                eta_str = "Unknown"
+                            
+                            self.log(
+                                f"📊 Parallel Progress: {completed_count}/{len(segments)} segments ({overall_progress*100:.1f}%) | "
+                                f"ETA: {eta_str} | Elapsed: {str(timedelta(seconds=int(elapsed)))}",
+                                "INFO"
+                            )
+                            last_log_time = current_time
+                        
+                        # Update callback
+                        if progress_callback:
+                            progress_callback(overall_progress)
+                    
+                    except Exception as e:
+                        segment_index = futures[future]
+                        error_msg = f"Future exception for segment {segment_index}: {type(e).__name__}: {e}"
+                        self.log(f"❌ {error_msg}", "ERROR")
+                        failed_segments.append((segments[segment_index], error_msg))
+                        completed_count += 1
+                
+                # Final progress callback
+                if progress_callback:
+                    progress_callback(1.0)
+                
+                # Process any remaining progress queue items
+                try:
+                    while not progress_queue.empty():
+                        progress_queue.get_nowait()
+                except queue.Empty:
+                    pass
+        
+        except Exception as e:
+            error_msg = f"Parallel segment processing error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return [], error_msg
+        
+        # Summary
+        total_time = time.time() - start_time
+        self.log(f"🏁 PARALLEL SEGMENT PROCESSING COMPLETE", "INFO")
+        self.log(f"   Total time: {timedelta(seconds=int(total_time))}", "INFO")
+        self.log(f"   Successful: {len(completed_segments)}", "INFO")
+        self.log(f"   Failed: {len(failed_segments)}", "INFO")
+        
+        if failed_segments:
+            self.log(f"❌ Failed segments:", "ERROR")
+            for segment_path, error in failed_segments[:5]:  # Show first 5 failures
+                self.log(f"   - {Path(segment_path).name}: {error}", "ERROR")
+            if len(failed_segments) > 5:
+                self.log(f"   ... and {len(failed_segments) - 5} more failures", "ERROR")
+        
+        if failed_segments:
+            return completed_segments, f"Parallel processing completed with {len(failed_segments)} failures"
+        else:
+            return completed_segments, "All segments processed successfully in parallel"
+    
+    def _process_segments_sequential(self, segments, output_dir, progress_callback=None):
+        """Fall back to sequential segment processing."""
+        completed_segments = []
+        failed_segments = []
+        
+        for i, segment_path in enumerate(segments):
+            segment_name = Path(segment_path).name
+            self.log(f"   Processing segment {i+1}/{len(segments)}: {segment_name}", "INFO")
+            
+            # Create output path
+            segment_path_obj = Path(segment_path)
+            output_path = Path(output_dir) / f"{segment_path_obj.stem}_compressed{segment_path_obj.suffix}"
+            
+            # Individual segment progress callback
+            def segment_progress(seg_progress):
+                if progress_callback:
+                    overall_progress = (i + seg_progress) / len(segments)
+                    progress_callback(overall_progress)
+            
+            # Compress the segment
+            success, message = self.compress_single_segment(segment_path, output_path, segment_progress)
+            
+            if success:
+                completed_segments.append(str(output_path))
+            else:
+                failed_segments.append((segment_path, message))
+                self.log(f"❌ Failed segment {i+1}: {message}", "ERROR")
+        
+        if progress_callback:
+            progress_callback(1.0)
+        
+        if failed_segments:
+            return completed_segments, f"Sequential processing completed with {len(failed_segments)} failures"
+        else:
+            return completed_segments, "All segments processed successfully sequentially"
+    
+    def process_files_parallel(self, file_list, dry_run=False, progress_callback=None):
+        """Process multiple files with intelligent parallel processing and load balancing."""
+        if not file_list:
+            self.log("No files provided for processing", "WARNING")
+            return
+        
+        self.log(f"\n{'='*60}", "INFO")
+        self.log(f"🚀 PARALLEL FILE PROCESSING {'(DRY RUN)' if dry_run else ''}", "INFO")
+        self.log(f"Files to process: {len(file_list)}", "INFO")
+        
+        if not self.parallel_enabled:
+            self.log("📝 Parallel processing disabled, falling back to sequential", "WARNING")
+            return self.process_file_list(file_list, dry_run, progress_callback)
+        
+        # Categorize files by size for intelligent processing
+        small_files = []  # < 10GB
+        large_files = []  # >= 10GB
+        
+        large_file_threshold = self.config.get("large_file_settings", {}).get("threshold_gb", 10) * (1024**3)
+        
+        for file_path in file_list:
+            if Path(file_path).exists():
+                file_size = os.path.getsize(file_path)
+                if file_size >= large_file_threshold:
+                    large_files.append(file_path)
+                else:
+                    small_files.append(file_path)
+            else:
+                self.log(f"⚠️  File not found, skipping: {file_path}", "WARNING")
+        
+        self.log(f"📊 File categorization:", "INFO")
+        self.log(f"   Small files (<{large_file_threshold/(1024**3):.0f}GB): {len(small_files)}", "INFO")
+        self.log(f"   Large files (≥{large_file_threshold/(1024**3):.0f}GB): {len(large_files)}", "INFO")
+        
+        if dry_run:
+            self.log("[DRY RUN] Would process files with the following strategy:", "INFO")
+            if small_files:
+                self.log(f"[DRY RUN]   Small files: Parallel processing with {min(self.max_concurrent_jobs, len(small_files))} workers", "INFO")
+            if large_files:
+                if self.segment_parallel:
+                    self.log(f"[DRY RUN]   Large files: Segmentation + parallel segment processing", "INFO")
+                else:
+                    self.log(f"[DRY RUN]   Large files: Sequential processing with individual segmentation", "INFO")
+            return
+        
+        start_time = time.time()
+        total_files_processed = 0
+        total_files_failed = 0
+        
+        try:
+            # Process small files in parallel first
+            if small_files:
+                self.log(f"\n🎯 PHASE 1: Parallel processing of {len(small_files)} small files", "INFO")
+                processed, failed = self._process_small_files_parallel(
+                    small_files, 
+                    lambda p: progress_callback(p * 0.5) if progress_callback else None  # First 50% of progress
+                )
+                total_files_processed += processed
+                total_files_failed += failed
+            
+            # Process large files with segmentation
+            if large_files:
+                self.log(f"\n🎯 PHASE 2: Processing {len(large_files)} large files", "INFO")
+                processed, failed = self._process_large_files_with_segmentation(
+                    large_files,
+                    lambda p: progress_callback(0.5 + p * 0.5) if progress_callback else None  # Second 50% of progress
+                )
+                total_files_processed += processed
+                total_files_failed += failed
+        
+        except KeyboardInterrupt:
+            self.log("\n⚠️  PROCESSING INTERRUPTED BY USER", "WARNING")
+            self.log("🧹 Performing emergency cleanup...", "INFO")
+            self.cleanup_all_temp_directories()
+            raise
+        except Exception as e:
+            error_msg = f"Parallel file processing error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            raise
+        
+        # Final summary
+        total_time = time.time() - start_time
+        self.log(f"\n{'='*60}", "INFO")
+        self.log(f"🏁 PARALLEL PROCESSING COMPLETE", "INFO")
+        self.log(f"   Total time: {timedelta(seconds=int(total_time))}", "INFO")
+        self.log(f"   Files processed: {total_files_processed}", "INFO")
+        self.log(f"   Files failed: {total_files_failed}", "INFO")
+        
+        if total_files_failed > 0:
+            self.log(f"⚠️  Some files failed to process. Check logs for details.", "WARNING")
+        
+        # Final progress callback
+        if progress_callback:
+            progress_callback(1.0)
+        
+        # Cleanup
+        self.log(f"🧹 Performing final cleanup...", "INFO")
+        self.cleanup_all_temp_directories()
+    
+    def _process_small_files_parallel(self, small_files, progress_callback=None):
+        """Process small files in parallel with load balancing."""
+        if not small_files:
+            return 0, 0
+        
+        actual_workers = min(self.max_concurrent_jobs, len(small_files))
+        processed_count = 0
+        failed_count = 0
+        
+        self.log(f"🔧 Processing {len(small_files)} small files with {actual_workers} parallel workers", "INFO")
+        
+        # Worker function for small file processing
+        def process_small_file_worker(file_path):
+            worker_id = threading.current_thread().name
+            file_name = Path(file_path).name
+            
+            try:
+                self.log(f"🔧 [{worker_id}] Starting: {file_name}", "DEBUG")
+                
+                # Use existing process_file method for comprehensive processing
+                success, message = self.process_file(file_path, dry_run=False)
+                
+                if success:
+                    self.log(f"✅ [{worker_id}] Completed: {file_name}", "DEBUG")
+                else:
+                    self.log(f"❌ [{worker_id}] Failed: {file_name} - {message}", "ERROR")
+                
+                return {'file_path': file_path, 'success': success, 'message': message, 'worker_id': worker_id}
+                
+            except Exception as e:
+                error_msg = f"Worker exception: {type(e).__name__}: {e}"
+                self.log(f"❌ [{worker_id}] Exception in {file_name}: {error_msg}", "ERROR")
+                return {'file_path': file_path, 'success': False, 'message': error_msg, 'worker_id': worker_id}
+        
+        try:
+            with ThreadPoolExecutor(max_workers=actual_workers, thread_name_prefix="SmallFileWorker") as executor:
+                # Submit all small file jobs
+                futures = {executor.submit(process_small_file_worker, file_path): file_path for file_path in small_files}
+                
+                # Process results as they complete
+                for i, future in enumerate(as_completed(futures), 1):
+                    try:
+                        result = future.result(timeout=7200)  # 2 hour timeout per small file
+                        
+                        if result['success']:
+                            processed_count += 1
+                            self.processed_files.append(result['file_path'])
+                        else:
+                            failed_count += 1
+                            self.failed_files.append((result['file_path'], result['message']))
+                        
+                        # Update progress
+                        if progress_callback:
+                            progress_callback(i / len(small_files))
+                        
+                        # Log progress every 5 files or at completion
+                        if i % 5 == 0 or i == len(small_files):
+                            self.log(f"📊 Small files progress: {i}/{len(small_files)} ({(i/len(small_files))*100:.1f}%)", "INFO")
+                    
+                    except Exception as e:
+                        file_path = futures[future]
+                        error_msg = f"Future exception: {type(e).__name__}: {e}"
+                        self.log(f"❌ Future error for {Path(file_path).name}: {error_msg}", "ERROR")
+                        failed_count += 1
+                        self.failed_files.append((file_path, error_msg))
+        
+        except Exception as e:
+            error_msg = f"Small files parallel processing error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            # Count remaining files as failed
+            failed_count += len(small_files) - processed_count
+        
+        self.log(f"✅ Small files phase complete: {processed_count} processed, {failed_count} failed", "INFO")
+        return processed_count, failed_count
+    
+    def _process_large_files_with_segmentation(self, large_files, progress_callback=None):
+        """Process large files using segmentation with optional parallel segment processing."""
+        if not large_files:
+            return 0, 0
+        
+        processed_count = 0
+        failed_count = 0
+        
+        self.log(f"🔧 Processing {len(large_files)} large files with segmentation", "INFO")
+        
+        for i, file_path in enumerate(large_files):
+            file_name = Path(file_path).name
+            self.log(f"\n📂 Large file {i+1}/{len(large_files)}: {file_name}", "INFO")
+            
+            try:
+                if self.segment_parallel:
+                    # Use parallel segment processing for large files
+                    success, message = self._process_large_file_with_parallel_segments(file_path)
+                else:
+                    # Use existing segmentation workflow
+                    success, message = self.process_file(file_path, dry_run=False)
+                
+                if success:
+                    processed_count += 1
+                    self.processed_files.append(file_path)
+                else:
+                    failed_count += 1
+                    self.failed_files.append((file_path, message))
+                    self.log(f"❌ Large file failed: {message}", "ERROR")
+                
+                # Update progress
+                if progress_callback:
+                    progress_callback((i + 1) / len(large_files))
+            
+            except Exception as e:
+                error_msg = f"Large file processing exception: {type(e).__name__}: {e}"
+                self.log(f"❌ Exception processing {file_name}: {error_msg}", "ERROR")
+                failed_count += 1
+                self.failed_files.append((file_path, error_msg))
+        
+        self.log(f"✅ Large files phase complete: {processed_count} processed, {failed_count} failed", "INFO")
+        return processed_count, failed_count
+    
+    def _process_large_file_with_parallel_segments(self, file_path):
+        """Process a single large file using parallel segment compression."""
+        file_path = Path(file_path)
+        self.log(f"🎯 LARGE FILE PARALLEL SEGMENTATION: {file_path.name}", "INFO")
+        
+        # Use existing safety checks
+        if not file_path.exists():
+            return False, f"File does not exist: {file_path}"
+        
+        space_ok, space_msg = self.check_disk_space(file_path)
+        if not space_ok:
+            return False, space_msg
+        
+        try:
+            # Step 1: Segment the large file
+            self.log(f"📁 Step 1: Segmenting large file...", "INFO")
+            segment_paths = self.segment_video(file_path)
+            if not segment_paths:
+                return False, "Failed to segment large file"
+            
+            # Step 2: Process segments in parallel
+            self.log(f"🔄 Step 2: Processing {len(segment_paths)} segments in parallel...", "INFO")
+            segments_dir = Path(segment_paths[0]).parent
+            
+            compressed_segments, result_message = self.process_segments_parallel(
+                segment_paths, segments_dir
+            )
+            
+            if not compressed_segments:
+                self.cleanup_segment_files(segment_paths)
+                return False, f"No segments were compressed: {result_message}"
+            
+            # Step 3: Merge compressed segments
+            self.log(f"🔗 Step 3: Merging compressed segments...", "INFO")
+            
+            # Create final output path
+            output_name = f"{file_path.stem}_compressed{file_path.suffix}"
+            final_output = file_path.parent / output_name
+            
+            success, merge_message = self.merge_compressed_segments(compressed_segments, final_output)
+            
+            if not success:
+                self.cleanup_segment_files(segment_paths, compressed_segments)
+                return False, f"Failed to merge segments: {merge_message}"
+            
+            # Step 4: Verify final file
+            self.log(f"🔍 Step 4: Verifying final merged file...", "INFO")
+            
+            original_info = self.get_video_info(file_path)
+            integrity_ok, integrity_msg = self.verify_file_integrity(final_output, original_info)
+            
+            if not integrity_ok:
+                self.cleanup_segment_files(segment_paths, compressed_segments)
+                return False, f"Final verification failed: {integrity_msg}"
+            
+            # Step 5: Calculate compression results
+            original_size = file_path.stat().st_size
+            compressed_size = final_output.stat().st_size
+            space_saved = original_size - compressed_size
+            
+            self.log(f"📊 Parallel compression results:", "INFO")
+            self.log(f"   Original size: {original_size / (1024**3):.2f}GB", "INFO")
+            self.log(f"   Compressed size: {compressed_size / (1024**3):.2f}GB", "INFO")
+            self.log(f"   Space saved: {space_saved / (1024**3):.2f}GB", "INFO")
+            
+            # Step 6: Delete original file after verification
+            self.log(f"🗑️  Step 5: Deleting original file...", "INFO")
+            file_path.unlink()
+            
+            # Step 7: Clean up segment files
+            self.log(f"🧹 Step 6: Cleaning up temporary files...", "INFO")
+            self.cleanup_segment_files(segment_paths, compressed_segments)
+            
+            self.log(f"✅ PARALLEL LARGE FILE PROCESSING COMPLETE", "INFO")
+            return True, f"Large file processed successfully with parallel segments. Saved {space_saved / (1024**3):.2f}GB"
+        
+        except Exception as e:
+            error_msg = f"Parallel large file processing error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
 
 
 def main():
