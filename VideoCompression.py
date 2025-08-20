@@ -2881,29 +2881,75 @@ class ParallelVideoProcessor(VideoCompressor):
             self.log(f"🔍 Step 1: Checking for existing segments to resume...", "INFO")
             existing_segments, missing_segments = self.check_existing_segments(file_path)
             
-            if existing_segments:
-                self.log(f"📂 Found {len(existing_segments)} existing segments, checking completeness...", "INFO")
-                valid_segments, invalid_segments = self.verify_segment_completeness(file_path, existing_segments)
+            # Step 1b: Also check for existing compressed segments (smart resume)
+            inferred_raw_segments, existing_compressed_segs, total_expected = self.check_existing_compressed_segments(file_path)
+            
+            # Prioritize compressed segments if we have them but no raw segments
+            if not existing_segments and existing_compressed_segs:
+                self.log(f"📂 Found {len(existing_compressed_segs)} existing compressed segments, enabling smart resume...", "INFO")
                 
-                if invalid_segments:
-                    self.log(f"🗑️  Removing {len(invalid_segments)} incomplete/corrupted segments...", "INFO")
-                    for invalid_segment in invalid_segments:
-                        try:
-                            Path(invalid_segment).unlink()
-                            self.log(f"   Deleted: {Path(invalid_segment).name}", "DEBUG")
-                        except Exception as e:
-                            self.log(f"   Warning: Could not delete {invalid_segment}: {e}", "WARNING")
+                # Extract segment numbers from compressed segments
+                compressed_segment_numbers = []
+                for compressed_path in existing_compressed_segs:
+                    parts = Path(compressed_path).stem.split('_')
+                    seg_num = int(parts[2])  # Extract segment number
+                    compressed_segment_numbers.append(seg_num)
                 
-                # Re-check what we need to create
-                existing_segments, missing_segments = self.check_existing_segments(file_path)
+                # Determine which segments we're missing
+                missing_segment_numbers = self.get_missing_segment_numbers(compressed_segment_numbers, total_expected)
                 
-                if len(existing_segments) > 0:
-                    self.log(f"✅ Resuming with {len(existing_segments)} valid segments, need to create {len(missing_segments)} more", "INFO")
+                if missing_segment_numbers:
+                    self.log(f"🔄 Need to create {len(missing_segment_numbers)} missing segments: {missing_segment_numbers}", "INFO")
                 else:
-                    self.log(f"🔄 No valid segments found, starting fresh segmentation", "INFO")
+                    self.log(f"✅ All {total_expected} segments already compressed, skipping to merge step", "INFO")
+                
+                # We'll handle this in the segmentation step
+                existing_segments = []  # No raw segments exist
+                use_smart_resume = True
+                smart_resume_info = {
+                    'existing_compressed': existing_compressed_segs,
+                    'missing_segment_numbers': missing_segment_numbers,
+                    'total_expected': total_expected
+                }
+            else:
+                use_smart_resume = False
+                smart_resume_info = None
+                
+                if existing_segments:
+                    self.log(f"📂 Found {len(existing_segments)} existing raw segments, checking completeness...", "INFO")
+                    valid_segments, invalid_segments = self.verify_segment_completeness(file_path, existing_segments)
+                    
+                    if invalid_segments:
+                        self.log(f"🗑️  Removing {len(invalid_segments)} incomplete/corrupted segments...", "INFO")
+                        for invalid_segment in invalid_segments:
+                            try:
+                                Path(invalid_segment).unlink()
+                                self.log(f"   Deleted: {Path(invalid_segment).name}", "DEBUG")
+                            except Exception as e:
+                                self.log(f"   Warning: Could not delete {invalid_segment}: {e}", "WARNING")
+                    
+                    # Re-check what we need to create
+                    existing_segments, missing_segments = self.check_existing_segments(file_path)
+                    
+                    if len(existing_segments) > 0:
+                        self.log(f"✅ Resuming with {len(existing_segments)} valid raw segments, need to create {len(missing_segments)} more", "INFO")
+                    else:
+                        self.log(f"🔄 No valid segments found, starting fresh segmentation", "INFO")
             
             # Step 2: Create missing segments if needed
-            if missing_segments or not existing_segments:
+            if use_smart_resume and smart_resume_info['missing_segment_numbers']:
+                # Smart resume: create only specific missing segments
+                self.log(f"📁 Step 2a: Creating {len(smart_resume_info['missing_segment_numbers'])} missing segments for smart resume...", "INFO")
+                new_segment_paths = self.create_specific_segments(file_path, smart_resume_info['missing_segment_numbers'])
+                if not new_segment_paths:
+                    return False, "Failed to create missing segments for smart resume"
+                all_segment_paths = new_segment_paths
+            elif use_smart_resume and not smart_resume_info['missing_segment_numbers']:
+                # All segments already compressed, skip segmentation
+                self.log(f"📁 Step 2a: All segments already compressed, skipping segmentation", "INFO")
+                all_segment_paths = []  # No raw segments needed
+            elif missing_segments or not existing_segments:
+                # Normal segmentation workflow
                 self.log(f"📁 Step 2a: Creating missing segments...", "INFO")
                 new_segment_paths = self.segment_video(file_path, existing_segments)
                 if not new_segment_paths and not existing_segments:
@@ -2918,15 +2964,32 @@ class ParallelVideoProcessor(VideoCompressor):
             all_segment_paths.sort()
             
             # Step 2b: Check for existing compressed segments
-            self.log(f"🔍 Step 2b: Checking for existing compressed segments...", "INFO")
-            segments_to_process, existing_compressed = self.filter_segments_for_processing(all_segment_paths)
+            if use_smart_resume:
+                # Smart resume: we already know what compressed segments exist
+                existing_compressed = smart_resume_info['existing_compressed']
+                if all_segment_paths:
+                    # Process newly created segments
+                    self.log(f"🔍 Step 2b: Processing {len(all_segment_paths)} newly created segments...", "INFO")
+                    segments_to_process = all_segment_paths
+                else:
+                    # All segments already compressed
+                    self.log(f"🔍 Step 2b: All segments already compressed, using existing...", "INFO")
+                    segments_to_process = []
+            else:
+                # Normal workflow
+                self.log(f"🔍 Step 2b: Checking for existing compressed segments...", "INFO")
+                segments_to_process, existing_compressed = self.filter_segments_for_processing(all_segment_paths)
             
             if existing_compressed:
                 self.log(f"📂 Found {len(existing_compressed)} existing compressed segments", "INFO")
             
             if segments_to_process:
                 self.log(f"🔄 Step 3: Processing {len(segments_to_process)} remaining segments in parallel...", "INFO")
-                segments_dir = Path(all_segment_paths[0]).parent
+                if use_smart_resume:
+                    # For smart resume, use the same directory as existing compressed segments
+                    segments_dir = Path(existing_compressed[0]).parent if existing_compressed else Path(all_segment_paths[0]).parent
+                else:
+                    segments_dir = Path(all_segment_paths[0]).parent
                 
                 # Force parallel processing by ensuring conditions are met
                 if len(segments_to_process) > 1 and self.parallel_enabled:
@@ -2949,6 +3012,21 @@ class ParallelVideoProcessor(VideoCompressor):
             if not compressed_segments:
                 self.cleanup_segment_files(all_segment_paths)
                 return False, f"No compressed segments available"
+            
+            # Sort compressed segments to ensure proper order for merging
+            def extract_segment_number(path):
+                """Extract segment number from compressed segment filename."""
+                try:
+                    parts = Path(path).stem.split('_')
+                    # Find the segment number (should be after 'segment')
+                    segment_idx = parts.index('segment')
+                    return int(parts[segment_idx + 1])
+                except (ValueError, IndexError):
+                    # Fallback to filename sorting
+                    return Path(path).name
+            
+            compressed_segments.sort(key=extract_segment_number)
+            self.log(f"📋 Sorted {len(compressed_segments)} compressed segments for merging", "DEBUG")
             
             # Step 3: Merge compressed segments
             self.log(f"🔗 Step 3: Merging compressed segments...", "INFO")
@@ -3204,6 +3282,86 @@ class ParallelVideoProcessor(VideoCompressor):
         missing_numbers = sorted(expected_numbers - existing_numbers)
         
         return missing_numbers
+
+    def create_specific_segments(self, input_path, segment_numbers):
+        """Create only specific segments by number using ffmpeg segment ranges.
+        
+        This is more efficient than creating all segments when we only need a few.
+        
+        Args:
+            input_path: Path to source video file
+            segment_numbers: List of segment numbers to create (1-based)
+            
+        Returns:
+            List of created segment file paths
+        """
+        if not segment_numbers:
+            return []
+            
+        self.log(f"📁 Creating specific segments: {segment_numbers}", "INFO")
+        input_path = Path(input_path)
+        
+        # Create segments directory
+        if self.config.get("large_file_settings", {}).get("use_same_filesystem", True):
+            segments_dir = input_path.parent / f"{input_path.stem}_segments"
+        else:
+            segments_dir = Path(self.config["temp_dir"]) / f"{input_path.stem}_segments"
+        
+        segments_dir.mkdir(exist_ok=True)
+        
+        # Get segment duration
+        segment_duration = self.config.get("segmentation_settings", {}).get("segment_duration_seconds", 600)
+        
+        created_segments = []
+        
+        for segment_num in segment_numbers:
+            # Calculate start time for this segment (0-based to 1-based conversion)
+            start_time = (segment_num - 1) * segment_duration
+            
+            # Create segment filename
+            segment_filename = f"{input_path.stem}_segment_{segment_num:03d}{input_path.suffix}"
+            segment_path = segments_dir / segment_filename
+            
+            # Build ffmpeg command for this specific segment
+            cmd = [
+                self.config["ffmpeg_path"],
+                "-i", str(input_path),
+                "-ss", str(start_time),  # Start time
+                "-t", str(segment_duration),  # Duration
+                "-c", "copy",  # Stream copy for speed
+                "-map", "0",   # Copy all streams
+                "-avoid_negative_ts", "make_zero",  # Handle timestamp issues
+                str(segment_path)
+            ]
+            
+            self.log(f"🎬 Creating segment {segment_num}: {segment_filename}", "INFO")
+            self.log(f"   Start time: {start_time}s, Duration: {segment_duration}s", "DEBUG")
+            
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 minutes per segment should be enough
+                )
+                
+                if result.returncode != 0:
+                    self.log(f"❌ Failed to create segment {segment_num}: {result.stderr}", "ERROR")
+                    continue
+                
+                if segment_path.exists() and segment_path.stat().st_size > 0:
+                    created_segments.append(str(segment_path))
+                    self.log(f"✅ Created segment {segment_num}: {segment_path.name} ({segment_path.stat().st_size / (1024**2):.1f}MB)", "INFO")
+                else:
+                    self.log(f"❌ Segment {segment_num} was not created or is empty", "ERROR")
+                    
+            except subprocess.TimeoutExpired:
+                self.log(f"❌ Timeout creating segment {segment_num}", "ERROR")
+            except Exception as e:
+                self.log(f"❌ Error creating segment {segment_num}: {e}", "ERROR")
+        
+        self.log(f"✅ Successfully created {len(created_segments)} specific segments", "INFO")
+        return created_segments
 
 
 def main():

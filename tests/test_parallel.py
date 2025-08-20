@@ -205,6 +205,45 @@ def test_parallel_conditions():
         print(f"   ❌ Parallel conditions test failed: {e}")
         return False
 
+def test_smart_resume_logic():
+    """Test the smart resume functionality for existing compressed segments."""
+    print("\n🧪 Testing smart resume logic for existing compressed segments...")
+    
+    try:
+        processor = ParallelVideoProcessor()
+        
+        # Test compressed segment detection
+        assert hasattr(processor, 'check_existing_compressed_segments'), "Should have check_existing_compressed_segments method"
+        assert hasattr(processor, 'get_missing_segment_numbers'), "Should have get_missing_segment_numbers method" 
+        assert hasattr(processor, 'create_specific_segments'), "Should have create_specific_segments method"
+        
+        print(f"   ✅ All smart resume methods exist")
+        
+        # Test missing segment number calculation
+        existing_numbers = [1, 2, 4, 5]  # Missing segment 3
+        total_expected = 5
+        missing = processor.get_missing_segment_numbers(existing_numbers, total_expected)
+        
+        assert missing == [3], f"Expected [3], got {missing}"
+        print(f"   ✅ Missing segment calculation works: {missing}")
+        
+        # Test edge cases
+        all_present = processor.get_missing_segment_numbers([1, 2, 3, 4, 5], 5)
+        assert all_present == [], f"Expected [], got {all_present}"
+        print(f"   ✅ All segments present case works: {all_present}")
+        
+        none_present = processor.get_missing_segment_numbers([], 3)
+        assert none_present == [1, 2, 3], f"Expected [1, 2, 3], got {none_present}"
+        print(f"   ✅ No segments present case works: {none_present}")
+        
+        print(f"   ✅ Smart resume logic test completed successfully")
+        
+        return True
+        
+    except Exception as e:
+        print(f"   ❌ Smart resume logic test failed: {e}")
+        return False
+
 def run_all_tests():
     """Run all parallel processing tests."""
     print("🚀 Running ParallelVideoProcessor Tests\n" + "="*50)
@@ -215,7 +254,8 @@ def run_all_tests():
         test_fallback_to_sequential,
         test_cpu_core_detection,
         test_dry_run_functionality,
-        test_parallel_conditions
+        test_parallel_conditions,
+        test_smart_resume_logic
     ]
     
     passed = 0
