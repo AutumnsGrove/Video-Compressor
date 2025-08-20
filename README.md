@@ -64,6 +64,8 @@ python VideoCompression.py --dry-run --files files.txt
 
 ## ⚙️ Configuration
 
+📖 **[Complete Configuration Reference](CONFIG.md)** - Detailed explanation of all settings
+
 ### config.json Settings
 ```json
 {
@@ -92,6 +94,8 @@ python VideoCompression.py --dry-run --files files.txt
 - **crf**: 18-28 range, lower = better quality
 - **preset**: ultrafast to veryslow, slower = better compression
 - **min_free_space_gb**: Safety buffer for disk space
+
+**📖 For detailed explanations of all 30+ configuration options, see [CONFIG.md](CONFIG.md)**
 
 ## 🛡️ Safety Protocol
 

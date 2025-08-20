@@ -199,7 +199,8 @@ class VideoCompressor:
                     "min_free_space_gb": 15,
                     "verify_integrity": True,
                     "create_backup_hash": True,
-                    "max_retries": 3
+                    "max_retries": 3,
+                    "delete_original_after_compression": True
                 },
                 "large_file_settings": {
                     "threshold_gb": 10,
@@ -2038,14 +2039,21 @@ class VideoCompressor:
             # Don't delete original - something went wrong
             return False, f"Final verification failed: {final_integrity_msg}"
         
-        # Step 7: ONLY NOW delete original file
-        self.log("Step 5: Deleting original file...")
-        try:
-            file_path.unlink()
-            self.log(f"Original file deleted: {file_path}")
-        except Exception as e:
-            self.log(f"Failed to delete original file: {e}", "ERROR")
-            return False, f"Failed to delete original file: {e}"
+        # Step 7: Delete original file (if enabled in config)
+        delete_original = self.config.get("safety_settings", {}).get("delete_original_after_compression", True)
+        
+        if delete_original:
+            self.log("Step 5: Deleting original file...")
+            try:
+                file_path.unlink()
+                self.log(f"✅ Original file deleted: {file_path}")
+            except Exception as e:
+                self.log(f"❌ Failed to delete original file: {e}", "ERROR")
+                return False, f"Failed to delete original file: {e}"
+        else:
+            self.log("Step 5: Preserving original file (deletion disabled in config)")
+            self.log(f"📁 Original file preserved: {file_path}")
+            self.log(f"📁 Compressed file created: {final_output}")
         
         # Step 8: Clean up temp directory
         if temp_dir.exists() and temp_dir.name == ".video_compression_temp":
@@ -2180,7 +2188,7 @@ class VideoCompressor:
                     video_info = self.get_video_info(file_path)
                     if video_info:
                         duration = self.get_video_duration(video_info)
-                        segment_duration = self.config.get("large_file_settings", {}).get("segment_duration_minutes", 10) * 60
+                        segment_duration = self.config.get("segmentation_settings", {}).get("segment_duration_seconds", 600)
                         estimated_segments = max(1, int(duration / segment_duration))
                         segment_info = {'current': 0, 'total': estimated_segments, 'duration': duration}
                 
@@ -2199,7 +2207,7 @@ class VideoCompressor:
                     video_info = self.get_video_info(file_path)
                     if video_info:
                         duration = self.get_video_duration(video_info)
-                        segment_duration = self.config.get("large_file_settings", {}).get("segment_duration_minutes", 10) * 60
+                        segment_duration = self.config.get("segmentation_settings", {}).get("segment_duration_seconds", 600)
                         estimated_segments = max(1, int(duration / segment_duration))
                         self.log(f"   📁 {Path(file_path).name} ({file_size_gb:.1f}GB) → {estimated_segments} segments")
                         
@@ -2900,9 +2908,17 @@ class ParallelVideoProcessor(VideoCompressor):
             self.log(f"   Compressed size: {compressed_size / (1024**3):.2f}GB", "INFO")
             self.log(f"   Space saved: {space_saved / (1024**3):.2f}GB", "INFO")
             
-            # Step 6: Delete original file after verification
-            self.log(f"🗑️  Step 5: Deleting original file...", "INFO")
-            file_path.unlink()
+            # Step 6: Delete original file after verification (if enabled)
+            delete_original = self.config.get("safety_settings", {}).get("delete_original_after_compression", True)
+            
+            if delete_original:
+                self.log(f"🗑️  Step 5: Deleting original file...", "INFO")
+                file_path.unlink()
+                self.log(f"✅ Original file deleted: {file_path}", "INFO")
+            else:
+                self.log(f"📁 Step 5: Preserving original file (deletion disabled in config)", "INFO")
+                self.log(f"📁 Original file preserved: {file_path}", "INFO")
+                self.log(f"📁 Compressed file created: {final_output}", "INFO")
             
             # Step 7: Clean up segment files
             self.log(f"🧹 Step 6: Cleaning up temporary files...", "INFO")

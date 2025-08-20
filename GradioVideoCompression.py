@@ -138,7 +138,8 @@ def create_interface():
     
     def process_videos_ui(file_paths_input, video_files, dry_run, 
                          target_bitrate_reduction, preserve_10bit, preserve_metadata,
-                         video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb, progress=gr.Progress()):
+                         video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb, 
+                         delete_original, progress=gr.Progress()):
         """Process videos through UI."""
         
         try:
@@ -152,6 +153,7 @@ def create_interface():
             config["compression_settings"]["crf"] = int(crf)
             config["compression_settings"]["enable_hardware_acceleration"] = enable_hardware_acceleration
             config["safety_settings"]["min_free_space_gb"] = min_free_space_gb
+            config["safety_settings"]["delete_original_after_compression"] = delete_original
             
             # Save temporary config
             temp_config_path = "temp_config.json"
@@ -438,7 +440,7 @@ def create_interface():
                 
                 gr.Markdown("### ⚠️ Safety Features")
                 gr.Markdown("""
-                - **Never deletes originals** until compressed file is verified
+                - **Configurable file deletion** - Choose to preserve or delete originals
                 - **Enhanced disk space checking** with cross-filesystem support  
                 - **Comprehensive file integrity verification** after compression
                 - **Structured logging** with automatic cleanup and rotation
@@ -502,6 +504,12 @@ def create_interface():
                 info="Required free space before processing"
             )
             
+            delete_original = gr.Checkbox(
+                value=safety_settings.get("delete_original_after_compression", True),
+                label="🗑️ Delete Original Files",
+                info="Delete original files after successful compression (CAUTION: Disable to preserve originals)"
+            )
+            
             # Test FFmpeg connection
             with gr.Row():
                 test_ffmpeg_btn = gr.Button("🔧 Test FFmpeg Connection", variant="secondary")
@@ -543,7 +551,8 @@ def create_interface():
             inputs=[
                 file_paths_input, video_input, dry_run,
                 target_bitrate_reduction, preserve_10bit, preserve_metadata,
-                video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb
+                video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb,
+                delete_original
             ],
             outputs=[results_output]
         )

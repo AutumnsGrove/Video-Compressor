@@ -15,10 +15,12 @@
     "min_free_space_gb": 15,
     "verify_integrity": true,
     "create_backup_hash": true,
-    "max_retries": 3
+    "max_retries": 3,
+    "delete_original_after_compression": true
   },
   "large_file_settings": {
     "threshold_gb": 10,
+    "segmentation_threshold_gb": 10,
     "enhanced_monitoring": true,
     "progress_update_interval": 10,
     "hash_chunk_size_mb": 5,
@@ -41,7 +43,9 @@
   },
   "segmentation_settings": {
     "segment_duration_seconds": 600,
-    "duration_threshold_minutes": 60,
+    "duration_threshold_minutes": 15,
+    "segmentation_timeout_minutes_per_gb": 1,
+    "min_segmentation_timeout_minutes": 5,
     "size_difference_warning_percent": 5,
     "merge_size_difference_warning_percent": 10
   }
