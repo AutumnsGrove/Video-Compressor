@@ -1499,7 +1499,7 @@ class VideoCompressor:
             self.log(f"Error checking segmentation criteria: {e}", "ERROR")
             return False
     
-    def segment_video(self, input_path, existing_segments=None, segment_duration=None):
+    def segment_video(self, input_path, existing_segments=None, segment_duration=None, progress_callback=None):
         """Segment video into smaller chunks using ffmpeg with stream copy for speed."""
         if segment_duration is None:
             segment_duration = self.config.get("segmentation_settings", {}).get("segment_duration_seconds", 600)
@@ -1527,7 +1527,8 @@ class VideoCompressor:
             self.config["ffmpeg_path"],
             "-i", str(input_path),
             "-c", "copy",  # Stream copy for maximum speed
-            "-map", "0",   # Copy all streams
+            "-map", "0:v",  # Copy video streams only
+            "-map", "0:a?",  # Copy audio streams only (? makes it optional)
             "-segment_time", str(segment_duration),
             "-f", "segment",
             "-reset_timestamps", "1",  # Reset timestamps for each segment
@@ -1550,12 +1551,61 @@ class VideoCompressor:
             self.log(f"⏱️  Starting segmentation (timeout: {timeout}s)...", "INFO")
             start_time = time.time()
             
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
+            # Run segmentation with progress monitoring
+            if progress_callback:
+                # Start FFmpeg process with progress monitoring
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                # Monitor progress in a separate thread
+                def progress_monitor():
+                    while process.poll() is None:
+                        elapsed_time = time.time() - start_time
+                        # Estimate progress based on elapsed time vs timeout
+                        # This is approximate since segmentation time varies
+                        estimated_progress = min(0.9, elapsed_time / (timeout * 0.8))  # Don't go above 90%
+                        progress_callback(estimated_progress)
+                        time.sleep(1)  # Update every second
+                
+                import threading
+                progress_thread = threading.Thread(target=progress_monitor)
+                progress_thread.daemon = True
+                progress_thread.start()
+                
+                # Wait for completion
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout)
+                    result_returncode = process.returncode
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    result_returncode = 1
+                    stderr = f"Segmentation timed out after {timeout}s"
+                
+                # Ensure progress reaches 100% on completion
+                if result_returncode == 0:
+                    progress_callback(1.0)
+                
+                # Create result-like object for compatibility
+                class Result:
+                    def __init__(self, returncode, stdout, stderr):
+                        self.returncode = returncode
+                        self.stdout = stdout
+                        self.stderr = stderr
+                
+                result = Result(result_returncode, stdout, stderr)
+            else:
+                # Fallback to simple subprocess.run if no progress callback
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
             
             end_time = time.time()
             duration = timedelta(seconds=int(end_time - start_time))
@@ -1748,7 +1798,14 @@ class VideoCompressor:
         if progress_callback:
             progress_callback(0.15)  # Segmentation starting
         
-        segment_paths = self.segment_video(input_path)
+        # Progress callback for segmentation phase (15% to 25%)
+        def segmentation_phase_progress(seg_progress):
+            if progress_callback:
+                # Map segmentation progress from 15% to 25%
+                overall_progress = 0.15 + (seg_progress * 0.10)
+                progress_callback(overall_progress)
+        
+        segment_paths = self.segment_video(input_path, progress_callback=segmentation_phase_progress)
         if not segment_paths:
             return False, "Failed to segment video file"
         
@@ -1756,69 +1813,30 @@ class VideoCompressor:
         if progress_callback:
             progress_callback(0.25)  # Segmentation complete
         
-        # Register all segment workers with the progress aggregator
-        total_file_size = os.path.getsize(input_path)
-        compressed_segments = []
-        total_segments = len(segment_paths)
-        
-        for i, segment_path in enumerate(segment_paths):
-            segment_size = os.path.getsize(segment_path)
-            worker_id = f"segment_{i+1}"
-            task_name = f"Segment {i+1}/{total_segments}: {Path(segment_path).name}"
-            segment_info = {'current': i+1, 'total': total_segments, 'duration': None}
-            self.progress_aggregator.register_worker(worker_id, task_name, segment_size, segment_info)
-        
         try:
-            # Step 2: Compress each segment individually
-            self.log(f"🎬 Step 2: Compressing {total_segments} segments...", "INFO")
+            # Step 2: Compress segments using parallel processing
+            self.log(f"🎬 Step 2: Compressing {len(segment_paths)} segments...", "INFO")
             
-            for i, segment_path in enumerate(segment_paths, 1):
-                segment_name = Path(segment_path).name
-                worker_id = f"segment_{i}"
-                
-                # Log aggregate progress before starting this segment
-                progress_data = self.progress_aggregator.get_aggregate_progress()
-                self.log(f"📊 Segmentation Progress: {progress_data['overall_progress']*100:.1f}% | "
-                         f"Workers: {progress_data['active_workers']}/{progress_data['total_workers']} | "
-                         f"Throughput: {progress_data['throughput_mbps']:.1f}MB/s", "INFO")
-                
-                self.log(f"   Processing segment {i}/{total_segments}: {segment_name}", "INFO")
-                
-                # Create compressed segment output path
-                segment_output = Path(segment_path).parent / f"{Path(segment_path).stem}_compressed{Path(segment_path).suffix}"
-                
-                # Progress callback for segment compression - simplified to avoid recursion
-                def segment_progress_callback(segment_progress):
-                    # Update this specific worker's progress
-                    self.progress_aggregator.update_worker_progress(worker_id, segment_progress)
-                    # Calculate overall progress: 25% for segmentation + 65% for compression + 10% for merge
-                    progress_data = self.progress_aggregator.get_aggregate_progress()
-                    overall_progress = 0.25 + (progress_data['overall_progress'] * 0.65)
-                    
-                    # Direct callback to avoid recursion
-                    if progress_callback:
-                        progress_callback(overall_progress)
-                
-                # Compress this segment (using existing single-file logic)
-                success, message = self.compress_single_segment(segment_path, segment_output, segment_progress_callback)
-                
-                if not success:
-                    # Mark worker as failed
-                    self.progress_aggregator.fail_worker(worker_id, message)
-                    # Clean up any partial segments
-                    self.cleanup_segment_files(segment_paths, compressed_segments)
-                    return False, f"Failed to compress segment {i}: {message}"
-                
-                # Mark worker as completed
-                self.progress_aggregator.complete_worker(worker_id)
-                compressed_segments.append(str(segment_output))
-                
-                # Clean up original segment after compression
-                try:
-                    Path(segment_path).unlink()
-                    self.log(f"   🧹 Cleaned up original segment: {segment_name}", "DEBUG")
-                except Exception as e:
-                    self.log(f"   ⚠️  Failed to clean up segment {segment_name}: {e}", "WARNING")
+            # Create segments output directory
+            segments_output_dir = Path(segment_paths[0]).parent
+            
+            # Progress callback wrapper for segmentation workflow
+            def segmentation_progress_callback(parallel_progress):
+                # Calculate overall progress: 25% for segmentation + 65% for compression + 10% for merge
+                overall_progress = 0.25 + (parallel_progress * 0.65)
+                if progress_callback:
+                    progress_callback(overall_progress)
+            
+            # Use parallel processing for segment compression
+            compressed_segments, result_message = self.process_segments_parallel(
+                segment_paths, 
+                segments_output_dir, 
+                segmentation_progress_callback
+            )
+            
+            if not compressed_segments:
+                self.cleanup_segment_files(segment_paths, [])
+                return False, f"Failed to compress segments: {result_message}"
             
             # Step 3: Merge compressed segments
             self.log(f"🔗 Step 3: Merging {len(compressed_segments)} compressed segments...", "INFO")
