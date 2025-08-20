@@ -21,6 +21,150 @@ import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
+class ProgressAggregator:
+    """Thread-safe progress aggregator for complex video processing workflows."""
+    
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._workers = {}  # worker_id -> worker_info
+        self._start_time = time.time()
+        self._total_bytes = 0
+        self._processed_bytes = 0
+        self._callback = None
+        
+    def register_worker(self, worker_id, task_name, file_size_bytes=0, segment_info=None):
+        """Register a new worker/task with the aggregator."""
+        with self._lock:
+            self._workers[worker_id] = {
+                'task_name': task_name,
+                'file_size_bytes': file_size_bytes,
+                'processed_bytes': 0,
+                'progress_pct': 0.0,
+                'fps': 0.0,
+                'status': 'starting',
+                'start_time': time.time(),
+                'last_update': time.time(),
+                'segment_info': segment_info,  # {'current': 1, 'total': 5, 'duration': 300}
+                'throughput_mbps': 0.0,
+                'eta_seconds': 0
+            }
+            self._total_bytes += file_size_bytes
+    
+    def update_worker_progress(self, worker_id, progress_pct, fps=0.0, processed_bytes=None):
+        """Update progress for a specific worker."""
+        with self._lock:
+            if worker_id not in self._workers:
+                return
+            
+            worker = self._workers[worker_id]
+            old_progress = worker['progress_pct']
+            worker['progress_pct'] = min(progress_pct, 1.0)
+            worker['fps'] = fps
+            worker['last_update'] = time.time()
+            worker['status'] = 'processing' if progress_pct < 1.0 else 'completed'
+            
+            # Calculate processed bytes if not provided
+            if processed_bytes is not None:
+                old_processed = worker['processed_bytes']
+                worker['processed_bytes'] = processed_bytes
+                self._processed_bytes += (processed_bytes - old_processed)
+            else:
+                # Estimate based on progress percentage
+                new_processed = worker['file_size_bytes'] * progress_pct
+                old_processed = worker['processed_bytes']
+                worker['processed_bytes'] = new_processed
+                self._processed_bytes += (new_processed - old_processed)
+            
+            # Calculate throughput (MB/s)
+            elapsed = time.time() - worker['start_time']
+            if elapsed > 0:
+                bytes_processed = worker['processed_bytes']
+                worker['throughput_mbps'] = (bytes_processed / (1024 * 1024)) / elapsed
+                
+                # Calculate ETA for this worker
+                if progress_pct > 0.01:
+                    total_time_est = elapsed / progress_pct
+                    worker['eta_seconds'] = max(0, total_time_est - elapsed)
+    
+    def get_aggregate_progress(self):
+        """Get overall progress across all workers."""
+        with self._lock:
+            if self._total_bytes == 0:
+                return {
+                    'overall_progress': 0.0,
+                    'active_workers': 0,
+                    'total_workers': len(self._workers),
+                    'throughput_mbps': 0.0,
+                    'eta_seconds': 0,
+                    'workers': []
+                }
+            
+            # Calculate weighted average progress
+            total_weighted_progress = 0.0
+            active_workers = 0
+            total_throughput = 0.0
+            max_eta = 0
+            
+            worker_details = []
+            for worker_id, worker in self._workers.items():
+                weight = worker['file_size_bytes'] / self._total_bytes if self._total_bytes > 0 else 1.0 / len(self._workers)
+                total_weighted_progress += worker['progress_pct'] * weight
+                
+                if worker['status'] == 'processing':
+                    active_workers += 1
+                
+                total_throughput += worker['throughput_mbps']
+                max_eta = max(max_eta, worker['eta_seconds'])
+                
+                worker_details.append({
+                    'id': worker_id,
+                    'task_name': worker['task_name'],
+                    'progress_pct': worker['progress_pct'],
+                    'fps': worker['fps'],
+                    'status': worker['status'],
+                    'throughput_mbps': worker['throughput_mbps'],
+                    'eta_seconds': worker['eta_seconds'],
+                    'segment_info': worker['segment_info']
+                })
+            
+            return {
+                'overall_progress': total_weighted_progress,
+                'active_workers': active_workers,
+                'total_workers': len(self._workers),
+                'throughput_mbps': total_throughput,
+                'eta_seconds': max_eta,
+                'workers': worker_details,
+                'total_bytes': self._total_bytes,
+                'processed_bytes': self._processed_bytes
+            }
+    
+    def set_callback(self, callback):
+        """Set callback function for progress updates."""
+        with self._lock:
+            self._callback = callback
+    
+    def notify_callback(self):
+        """Notify the callback with current progress."""
+        if self._callback:
+            progress_data = self.get_aggregate_progress()
+            self._callback(progress_data)
+    
+    def complete_worker(self, worker_id):
+        """Mark a worker as completed."""
+        with self._lock:
+            if worker_id in self._workers:
+                self._workers[worker_id]['status'] = 'completed'
+                self._workers[worker_id]['progress_pct'] = 1.0
+                self.notify_callback()
+    
+    def fail_worker(self, worker_id, error_message):
+        """Mark a worker as failed."""
+        with self._lock:
+            if worker_id in self._workers:
+                self._workers[worker_id]['status'] = 'failed'
+                self._workers[worker_id]['error'] = error_message
+                self.notify_callback()
+
 class VideoCompressor:
     def __init__(self, config_path="config.json"):
         self.config = self.load_config(config_path)
@@ -28,6 +172,7 @@ class VideoCompressor:
         self.setup_enhanced_logging()
         self.processed_files = []
         self.failed_files = []
+        self.progress_aggregator = ProgressAggregator()
         
     def load_config(self, config_path):
         """Load configuration from JSON file."""
@@ -809,6 +954,14 @@ class VideoCompressor:
         
         # Get video duration for progress calculation
         video_duration = self.get_video_duration(original_info)
+        file_size = os.path.getsize(input_path)
+        
+        # Register with progress aggregator
+        worker_id = f"single_compress_{int(time.time())}"
+        task_name = f"Compressing {Path(input_path).name}"
+        self.progress_aggregator.register_worker(worker_id, task_name, file_size)
+        if progress_callback:
+            self.progress_aggregator.set_callback(progress_callback)
         
         # Build ffmpeg command with progress output to stderr
         cmd = self.build_ffmpeg_command(input_path, output_path, original_info)
@@ -914,9 +1067,14 @@ class VideoCompressor:
                     if isinstance(update[0], float):  # Progress percentage
                         progress_pct, current_seconds, fps, size_kb, line = update
                         
-                        # Update progress callback more frequently
-                        if progress_callback:
-                            progress_callback(progress_pct)
+                        # Update progress aggregator with detailed metrics
+                        processed_bytes = (size_kb * 1024) if size_kb > 0 else None
+                        self.progress_aggregator.update_worker_progress(
+                            worker_id, progress_pct, fps, processed_bytes
+                        )
+                        
+                        # Notify callback through aggregator for enhanced data
+                        self.progress_aggregator.notify_callback()
                         
                         # Log progress with enhanced info for large files
                         if (current_time - last_log_time > 10.0 or  # Every 10 seconds
@@ -929,10 +1087,16 @@ class VideoCompressor:
                                 remaining = total_estimated - elapsed
                                 time_remaining = str(timedelta(seconds=int(remaining)))
                             
+                            # Calculate throughput
+                            throughput_mbps = 0
+                            if elapsed > 0 and size_kb > 0:
+                                throughput_mbps = (size_kb / 1024) / elapsed
+                            
                             self.log(
-                                f"📊 Progress: {progress_pct*100:.1f}% | "
+                                f"📊 Single File Progress: {progress_pct*100:.1f}% | "
                                 f"{current_seconds:.1f}s/{video_duration:.1f}s | "
                                 f"FPS: {fps:.1f} | Size: {size_kb//1024:.1f}MB | "
+                                f"Throughput: {throughput_mbps:.1f}MB/s | "
                                 f"ETA: {time_remaining}",
                                 "INFO"
                             )
@@ -951,10 +1115,6 @@ class VideoCompressor:
                         last_update_time = current_time
                     continue
             
-            # Final callback update
-            if progress_callback:
-                progress_callback(1.0)
-            
             # Wait for process to complete and cleanup monitoring
             process.wait()
             monitor_thread.join(timeout=5.0)  # Longer timeout for large files
@@ -967,6 +1127,9 @@ class VideoCompressor:
                 pass
             
             if process.returncode != 0:
+                # Mark worker as failed
+                self.progress_aggregator.fail_worker(worker_id, f"FFmpeg failed with return code {process.returncode}")
+                
                 # Capture stderr for detailed error info
                 try:
                     stderr_output = process.stderr.read() if process.stderr else "No stderr available"
@@ -978,6 +1141,9 @@ class VideoCompressor:
                 self.log(f"   FFmpeg stderr: {stderr_output[-500:] if stderr_output else 'N/A'}", "ERROR")  # Last 500 chars
                 return False, f"{error_msg}. Check logs for details."
             
+            # Mark worker as completed
+            self.progress_aggregator.complete_worker(worker_id)
+            
             end_time = time.time()
             duration = timedelta(seconds=int(end_time - start_time))
             self.log(f"Compression completed in {duration}")
@@ -985,6 +1151,9 @@ class VideoCompressor:
             return True, "Compression successful"
             
         except Exception as e:
+            # Mark worker as failed
+            self.progress_aggregator.fail_worker(worker_id, f"Exception: {type(e).__name__}: {e}")
+            
             error_msg = f"Compression error: {type(e).__name__}: {e}"
             self.log(f"❌ {error_msg}", "ERROR")
             
@@ -1458,6 +1627,11 @@ class VideoCompressor:
         input_path = Path(input_path)
         output_path = Path(output_path)
         
+        # Reset progress aggregator for this segmentation workflow
+        self.progress_aggregator = ProgressAggregator()
+        if progress_callback:
+            self.progress_aggregator.set_callback(progress_callback)
+        
         # Step 1: Segment the original video
         self.log(f"📁 Step 1: Segmenting large video file...", "INFO")
         segment_paths = self.segment_video(input_path)
@@ -1466,8 +1640,17 @@ class VideoCompressor:
         
         self.log(f"✅ Created {len(segment_paths)} segments", "INFO")
         
+        # Register all segment workers with the progress aggregator
+        total_file_size = os.path.getsize(input_path)
         compressed_segments = []
         total_segments = len(segment_paths)
+        
+        for i, segment_path in enumerate(segment_paths):
+            segment_size = os.path.getsize(segment_path)
+            worker_id = f"segment_{i+1}"
+            task_name = f"Segment {i+1}/{total_segments}: {Path(segment_path).name}"
+            segment_info = {'current': i+1, 'total': total_segments, 'duration': None}
+            self.progress_aggregator.register_worker(worker_id, task_name, segment_size, segment_info)
         
         try:
             # Step 2: Compress each segment individually
@@ -1475,6 +1658,14 @@ class VideoCompressor:
             
             for i, segment_path in enumerate(segment_paths, 1):
                 segment_name = Path(segment_path).name
+                worker_id = f"segment_{i}"
+                
+                # Log aggregate progress before starting this segment
+                progress_data = self.progress_aggregator.get_aggregate_progress()
+                self.log(f"📊 Segmentation Progress: {progress_data['overall_progress']*100:.1f}% | "
+                         f"Workers: {progress_data['active_workers']}/{progress_data['total_workers']} | "
+                         f"Throughput: {progress_data['throughput_mbps']:.1f}MB/s", "INFO")
+                
                 self.log(f"   Processing segment {i}/{total_segments}: {segment_name}", "INFO")
                 
                 # Create compressed segment output path
@@ -1482,20 +1673,23 @@ class VideoCompressor:
                 
                 # Progress callback for segment compression
                 def segment_progress_callback(segment_progress):
-                    if progress_callback:
-                        # Calculate overall progress: segmentation done (10%), current segment compression
-                        segment_weight = 0.8 / total_segments  # 80% for all compressions
-                        overall_progress = 0.1 + (i - 1) * segment_weight + segment_progress * segment_weight
-                        progress_callback(overall_progress)
+                    # Update this specific worker's progress
+                    self.progress_aggregator.update_worker_progress(worker_id, segment_progress)
+                    # Notify the main callback through aggregator
+                    self.progress_aggregator.notify_callback()
                 
                 # Compress this segment (using existing single-file logic)
                 success, message = self.compress_single_segment(segment_path, segment_output, segment_progress_callback)
                 
                 if not success:
+                    # Mark worker as failed
+                    self.progress_aggregator.fail_worker(worker_id, message)
                     # Clean up any partial segments
                     self.cleanup_segment_files(segment_paths, compressed_segments)
                     return False, f"Failed to compress segment {i}: {message}"
                 
+                # Mark worker as completed
+                self.progress_aggregator.complete_worker(worker_id)
                 compressed_segments.append(str(segment_output))
                 
                 # Clean up original segment after compression
@@ -2092,6 +2286,19 @@ class ParallelVideoProcessor(VideoCompressor):
         self.log(f"   Parallel workers: {min(self.max_concurrent_jobs, len(segments))}", "INFO")
         self.log(f"   Output directory: {output_dir}", "DEBUG")
         
+        # Reset progress aggregator for parallel processing
+        self.progress_aggregator = ProgressAggregator()
+        if progress_callback:
+            self.progress_aggregator.set_callback(progress_callback)
+        
+        # Register all segment workers
+        for i, segment_path in enumerate(segments):
+            segment_size = os.path.getsize(segment_path)
+            worker_id = f"parallel_segment_{i+1}"
+            task_name = f"Parallel Segment {i+1}/{len(segments)}: {Path(segment_path).name}"
+            segment_info = {'current': i+1, 'total': len(segments), 'duration': None}
+            self.progress_aggregator.register_worker(worker_id, task_name, segment_size, segment_info)
+        
         # Prepare progress tracking
         progress_queue = queue.Queue()
         completed_segments = []
@@ -2112,6 +2319,11 @@ class ParallelVideoProcessor(VideoCompressor):
                 
                 # Individual segment progress callback
                 def segment_progress(seg_progress):
+                    # Update progress aggregator for this worker
+                    progress_worker_id = f"parallel_segment_{segment_index+1}"
+                    self.progress_aggregator.update_worker_progress(progress_worker_id, seg_progress)
+                    
+                    # Also update the old queue system for backwards compatibility
                     try:
                         progress_queue.put({
                             'type': 'segment_progress',
@@ -2125,7 +2337,11 @@ class ParallelVideoProcessor(VideoCompressor):
                 # Compress the segment
                 success, message = self.compress_single_segment(segment_path, output_path, segment_progress)
                 
+                progress_worker_id = f"parallel_segment_{segment_index+1}"
+                
                 if success:
+                    # Mark worker as completed in progress aggregator
+                    self.progress_aggregator.complete_worker(progress_worker_id)
                     self.log(f"✅ [{worker_id}] Completed segment {segment_index+1}: {segment_name}", "DEBUG")
                     result = {
                         'type': 'segment_complete',
@@ -2137,6 +2353,8 @@ class ParallelVideoProcessor(VideoCompressor):
                         'worker_id': worker_id
                     }
                 else:
+                    # Mark worker as failed in progress aggregator
+                    self.progress_aggregator.fail_worker(progress_worker_id, message)
                     self.log(f"❌ [{worker_id}] Failed segment {segment_index+1}: {segment_name} - {message}", "ERROR")
                     result = {
                         'type': 'segment_complete',
@@ -2158,6 +2376,10 @@ class ParallelVideoProcessor(VideoCompressor):
             except Exception as e:
                 error_msg = f"Worker exception in segment {segment_index+1}: {type(e).__name__}: {e}"
                 self.log(f"❌ [{worker_id}] {error_msg}", "ERROR")
+                
+                # Mark worker as failed in progress aggregator
+                progress_worker_id = f"parallel_segment_{segment_index+1}"
+                self.progress_aggregator.fail_worker(progress_worker_id, error_msg)
                 
                 result = {
                     'type': 'segment_complete',
@@ -2209,28 +2431,37 @@ class ParallelVideoProcessor(VideoCompressor):
                         completed_count += 1
                         segment_progress[result['segment_index']] = 1.0
                         
-                        # Calculate and report overall progress
-                        overall_progress = completed_count / len(segments)
+                        # Get enhanced progress data from aggregator
+                        progress_data = self.progress_aggregator.get_aggregate_progress()
+                        overall_progress = progress_data['overall_progress']
                         
                         current_time = time.time()
                         if current_time - last_log_time > 10.0 or completed_count == len(segments):  # Every 10 seconds or final
                             elapsed = current_time - start_time
-                            if overall_progress > 0:
-                                eta = (elapsed / overall_progress) * (1 - overall_progress)
-                                eta_str = str(timedelta(seconds=int(eta)))
-                            else:
-                                eta_str = "Unknown"
                             
+                            # Log detailed parallel worker status
                             self.log(
                                 f"📊 Parallel Progress: {completed_count}/{len(segments)} segments ({overall_progress*100:.1f}%) | "
-                                f"ETA: {eta_str} | Elapsed: {str(timedelta(seconds=int(elapsed)))}",
+                                f"Active Workers: {progress_data['active_workers']}/{progress_data['total_workers']} | "
+                                f"Total Throughput: {progress_data['throughput_mbps']:.1f}MB/s | "
+                                f"ETA: {str(timedelta(seconds=int(progress_data['eta_seconds'])))} | "
+                                f"Elapsed: {str(timedelta(seconds=int(elapsed)))}",
                                 "INFO"
                             )
+                            
+                            # Log individual worker statuses
+                            for worker in progress_data['workers']:
+                                if worker['status'] == 'processing':
+                                    self.log(
+                                        f"   🔧 {worker['task_name']}: {worker['progress_pct']*100:.1f}% | "
+                                        f"FPS: {worker['fps']:.1f} | Throughput: {worker['throughput_mbps']:.1f}MB/s",
+                                        "DEBUG"
+                                    )
+                            
                             last_log_time = current_time
                         
-                        # Update callback
-                        if progress_callback:
-                            progress_callback(overall_progress)
+                        # Notify callback through aggregator
+                        self.progress_aggregator.notify_callback()
                     
                     except Exception as e:
                         segment_index = futures[future]

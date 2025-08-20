@@ -4,7 +4,7 @@ import os
 import json
 import gradio as gr
 from pathlib import Path
-from VideoCompression import VideoCompressor
+from VideoCompression import VideoCompressor, ParallelVideoProcessor
 import tempfile
 
 def create_interface():
@@ -22,7 +22,7 @@ def create_interface():
     def test_ffmpeg_connection():
         """Test FFmpeg installation and hardware acceleration."""
         try:
-            compressor = VideoCompressor()
+            compressor = ParallelVideoProcessor()
             ffmpeg_path = compressor.config["ffmpeg_path"]
             
             # Test ffmpeg
@@ -158,8 +158,8 @@ def create_interface():
             with open(temp_config_path, 'w') as f:
                 json.dump(config, f, indent=2)
             
-            # Create compressor with temporary config
-            compressor = VideoCompressor(temp_config_path)
+            # Create parallel compressor with temporary config for enhanced progress tracking
+            compressor = ParallelVideoProcessor(temp_config_path)
             
             # Collect files to process
             files_to_process = []
@@ -216,11 +216,36 @@ def create_interface():
             original_log = compressor.log
             compressor.log = ui_logger.log
             
-            # Create batch progress callback
-            def batch_progress_callback(overall_progress, status_message):
-                # Map overall progress to 0.2 -> 0.95 range (leaving some room for final steps)
-                mapped_progress = 0.2 + (overall_progress * 0.75)
-                progress(mapped_progress, desc=status_message)
+            # Create enhanced batch progress callback
+            def batch_progress_callback(progress_data):
+                # Handle both old-style callbacks and new enhanced progress data
+                if isinstance(progress_data, dict):
+                    # New enhanced progress data from ProgressAggregator
+                    overall_progress = progress_data.get('overall_progress', 0.0)
+                    active_workers = progress_data.get('active_workers', 0)
+                    total_workers = progress_data.get('total_workers', 0)
+                    throughput_mbps = progress_data.get('throughput_mbps', 0.0)
+                    eta_seconds = progress_data.get('eta_seconds', 0)
+                    
+                    # Create enhanced status message
+                    if active_workers > 0:
+                        if eta_seconds > 0:
+                            eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
+                            status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
+                        else:
+                            status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s"
+                    else:
+                        status_message = f"Processing complete | Total throughput: {throughput_mbps:.1f}MB/s"
+                    
+                    # Map overall progress to 0.2 -> 0.95 range 
+                    mapped_progress = 0.2 + (overall_progress * 0.75)
+                    progress(mapped_progress, desc=status_message)
+                    
+                else:
+                    # Handle old-style callback (for backwards compatibility)
+                    overall_progress = progress_data if isinstance(progress_data, (int, float)) else 0.0
+                    mapped_progress = 0.2 + (overall_progress * 0.75)
+                    progress(mapped_progress, desc="Processing files...")
             
             try:
                 # Process all files using batch processing with progress
@@ -247,6 +272,11 @@ def create_interface():
 - **Hardware Acceleration:** {'🚀 Enabled' if enable_hardware_acceleration else '❌ Disabled'}
 - **Preserve 10-bit:** {'✅' if preserve_10bit else '❌'}
 - **Preserve Metadata:** {'✅' if preserve_metadata else '❌'}
+
+## 🚀 Parallel Processing Info:
+- **Parallel Processing:** {'✅ Enabled' if compressor.parallel_enabled else '❌ Disabled'}
+- **Max Concurrent Jobs:** {compressor.max_concurrent_jobs}
+- **Segment Parallel:** {'✅ Enabled' if compressor.segment_parallel else '❌ Disabled'}
 """
                 
                 # Add file-by-file analysis for dry runs
