@@ -31,6 +31,7 @@ class ProgressAggregator:
         self._total_bytes = 0
         self._processed_bytes = 0
         self._callback = None
+        self._notifying = False  # Prevent recursion in callback notifications
         
     def register_worker(self, worker_id, task_name, file_size_bytes=0, segment_info=None):
         """Register a new worker/task with the aggregator."""
@@ -145,9 +146,14 @@ class ProgressAggregator:
     
     def notify_callback(self):
         """Notify the callback with current progress."""
-        if self._callback:
-            progress_data = self.get_aggregate_progress()
-            self._callback(progress_data)
+        with self._lock:
+            if self._callback and not self._notifying:
+                self._notifying = True
+                try:
+                    progress_data = self.get_aggregate_progress()
+                    self._callback(progress_data)
+                finally:
+                    self._notifying = False
     
     def complete_worker(self, worker_id):
         """Mark a worker as completed."""
@@ -1393,7 +1399,7 @@ class VideoCompressor:
             self.log(f"Error checking segmentation criteria: {e}", "ERROR")
             return False
     
-    def segment_video(self, input_path, segment_duration=None):
+    def segment_video(self, input_path, existing_segments=None, segment_duration=None):
         """Segment video into smaller chunks using ffmpeg with stream copy for speed."""
         if segment_duration is None:
             segment_duration = self.config.get("segmentation_settings", {}).get("segment_duration_seconds", 600)
@@ -1628,6 +1634,10 @@ class VideoCompressor:
         input_path = Path(input_path)
         output_path = Path(output_path)
         
+        # Report initial segmentation progress
+        if progress_callback:
+            progress_callback(0.1)  # Starting segmentation
+        
         # Reset progress aggregator for this segmentation workflow
         self.progress_aggregator = ProgressAggregator()
         if progress_callback:
@@ -1635,11 +1645,16 @@ class VideoCompressor:
         
         # Step 1: Segment the original video
         self.log(f"📁 Step 1: Segmenting large video file...", "INFO")
+        if progress_callback:
+            progress_callback(0.15)  # Segmentation starting
+        
         segment_paths = self.segment_video(input_path)
         if not segment_paths:
             return False, "Failed to segment video file"
         
         self.log(f"✅ Created {len(segment_paths)} segments", "INFO")
+        if progress_callback:
+            progress_callback(0.25)  # Segmentation complete
         
         # Register all segment workers with the progress aggregator
         total_file_size = os.path.getsize(input_path)
@@ -1672,12 +1687,17 @@ class VideoCompressor:
                 # Create compressed segment output path
                 segment_output = Path(segment_path).parent / f"{Path(segment_path).stem}_compressed{Path(segment_path).suffix}"
                 
-                # Progress callback for segment compression
+                # Progress callback for segment compression - simplified to avoid recursion
                 def segment_progress_callback(segment_progress):
                     # Update this specific worker's progress
                     self.progress_aggregator.update_worker_progress(worker_id, segment_progress)
-                    # Notify the main callback through aggregator
-                    self.progress_aggregator.notify_callback()
+                    # Calculate overall progress: 25% for segmentation + 65% for compression + 10% for merge
+                    progress_data = self.progress_aggregator.get_aggregate_progress()
+                    overall_progress = 0.25 + (progress_data['overall_progress'] * 0.65)
+                    
+                    # Direct callback to avoid recursion
+                    if progress_callback:
+                        progress_callback(overall_progress)
                 
                 # Compress this segment (using existing single-file logic)
                 success, message = self.compress_single_segment(segment_path, segment_output, segment_progress_callback)
@@ -1705,7 +1725,7 @@ class VideoCompressor:
             
             # Update progress for merging phase
             if progress_callback:
-                progress_callback(0.9)  # 90% complete, starting merge
+                progress_callback(0.90)  # 90% complete, starting merge
             
             success, message = self.merge_compressed_segments(compressed_segments, output_path)
             if not success:
@@ -2857,23 +2877,78 @@ class ParallelVideoProcessor(VideoCompressor):
             return False, space_msg
         
         try:
-            # Step 1: Segment the large file
-            self.log(f"📁 Step 1: Segmenting large file...", "INFO")
-            segment_paths = self.segment_video(file_path)
-            if not segment_paths:
-                return False, "Failed to segment large file"
+            # Step 1: Check for existing segments and resume capability
+            self.log(f"🔍 Step 1: Checking for existing segments to resume...", "INFO")
+            existing_segments, missing_segments = self.check_existing_segments(file_path)
             
-            # Step 2: Process segments in parallel
-            self.log(f"🔄 Step 2: Processing {len(segment_paths)} segments in parallel...", "INFO")
-            segments_dir = Path(segment_paths[0]).parent
+            if existing_segments:
+                self.log(f"📂 Found {len(existing_segments)} existing segments, checking completeness...", "INFO")
+                valid_segments, invalid_segments = self.verify_segment_completeness(file_path, existing_segments)
+                
+                if invalid_segments:
+                    self.log(f"🗑️  Removing {len(invalid_segments)} incomplete/corrupted segments...", "INFO")
+                    for invalid_segment in invalid_segments:
+                        try:
+                            Path(invalid_segment).unlink()
+                            self.log(f"   Deleted: {Path(invalid_segment).name}", "DEBUG")
+                        except Exception as e:
+                            self.log(f"   Warning: Could not delete {invalid_segment}: {e}", "WARNING")
+                
+                # Re-check what we need to create
+                existing_segments, missing_segments = self.check_existing_segments(file_path)
+                
+                if len(existing_segments) > 0:
+                    self.log(f"✅ Resuming with {len(existing_segments)} valid segments, need to create {len(missing_segments)} more", "INFO")
+                else:
+                    self.log(f"🔄 No valid segments found, starting fresh segmentation", "INFO")
             
-            compressed_segments, result_message = self.process_segments_parallel(
-                segment_paths, segments_dir
-            )
+            # Step 2: Create missing segments if needed
+            if missing_segments or not existing_segments:
+                self.log(f"📁 Step 2a: Creating missing segments...", "INFO")
+                new_segment_paths = self.segment_video(file_path, existing_segments)
+                if not new_segment_paths and not existing_segments:
+                    return False, "Failed to create segments"
+                # Combine existing and new segments
+                all_segment_paths = existing_segments + (new_segment_paths or [])
+            else:
+                all_segment_paths = existing_segments
+                self.log(f"📁 Step 2a: Using existing segments (no new segments needed)", "INFO")
+            
+            # Sort segments to ensure proper order
+            all_segment_paths.sort()
+            
+            # Step 2b: Check for existing compressed segments
+            self.log(f"🔍 Step 2b: Checking for existing compressed segments...", "INFO")
+            segments_to_process, existing_compressed = self.filter_segments_for_processing(all_segment_paths)
+            
+            if existing_compressed:
+                self.log(f"📂 Found {len(existing_compressed)} existing compressed segments", "INFO")
+            
+            if segments_to_process:
+                self.log(f"🔄 Step 3: Processing {len(segments_to_process)} remaining segments in parallel...", "INFO")
+                segments_dir = Path(all_segment_paths[0]).parent
+                
+                # Force parallel processing by ensuring conditions are met
+                if len(segments_to_process) > 1 and self.parallel_enabled:
+                    self.log(f"   ⚡ Using {min(self.max_concurrent_jobs, len(segments_to_process))} parallel workers", "INFO")
+                
+                newly_compressed_segments, result_message = self.process_segments_parallel(
+                    segments_to_process, segments_dir
+                )
+                
+                if not newly_compressed_segments and not existing_compressed:
+                    self.cleanup_segment_files(all_segment_paths)
+                    return False, f"No segments were compressed: {result_message}"
+                
+                # Combine existing and newly compressed segments
+                compressed_segments = existing_compressed + (newly_compressed_segments or [])
+            else:
+                self.log(f"✅ Step 3: All segments already compressed, proceeding to merge...", "INFO")
+                compressed_segments = existing_compressed
             
             if not compressed_segments:
-                self.cleanup_segment_files(segment_paths)
-                return False, f"No segments were compressed: {result_message}"
+                self.cleanup_segment_files(all_segment_paths)
+                return False, f"No compressed segments available"
             
             # Step 3: Merge compressed segments
             self.log(f"🔗 Step 3: Merging compressed segments...", "INFO")
@@ -2922,7 +2997,7 @@ class ParallelVideoProcessor(VideoCompressor):
             
             # Step 7: Clean up segment files
             self.log(f"🧹 Step 6: Cleaning up temporary files...", "INFO")
-            self.cleanup_segment_files(segment_paths, compressed_segments)
+            self.cleanup_segment_files(all_segment_paths, compressed_segments)
             
             self.log(f"✅ PARALLEL LARGE FILE PROCESSING COMPLETE", "INFO")
             return True, f"Large file processed successfully with parallel segments. Saved {space_saved / (1024**3):.2f}GB"
@@ -2931,6 +3006,204 @@ class ParallelVideoProcessor(VideoCompressor):
             error_msg = f"Parallel large file processing error: {type(e).__name__}: {e}"
             self.log(f"❌ {error_msg}", "ERROR")
             return False, error_msg
+    
+    def check_existing_segments(self, source_file):
+        """Check for existing segment files and determine what's missing."""
+        source_path = Path(source_file)
+        segments_dir = source_path.parent / f"{source_path.stem}_segments"
+        
+        if not segments_dir.exists():
+            self.log(f"   No segments directory found: {segments_dir}", "DEBUG")
+            return [], []
+        
+        # Get expected segment pattern
+        segment_pattern = f"{source_path.stem}_segment_*.mov"
+        existing_files = list(segments_dir.glob(segment_pattern))
+        
+        if not existing_files:
+            self.log(f"   No existing segments found in {segments_dir}", "DEBUG")
+            return [], []
+        
+        # Sort by segment number
+        existing_files.sort(key=lambda x: int(x.stem.split('_')[-1]))
+        existing_paths = [str(f) for f in existing_files]
+        
+        self.log(f"   Found {len(existing_paths)} existing segment files", "DEBUG")
+        return existing_paths, []
+    
+    def verify_segment_completeness(self, source_file, segment_paths):
+        """Verify that segments are complete and valid against source duration."""
+        if not segment_paths:
+            return [], []
+        
+        try:
+            # Get source video info
+            source_info = self.get_video_info(source_file)
+            if not source_info:
+                self.log(f"   Cannot get source video info for verification", "WARNING")
+                return segment_paths, []  # Assume valid if we can't verify
+            
+            source_duration = float(source_info.get("format", {}).get("duration", 0))
+            if source_duration <= 0:
+                self.log(f"   Cannot determine source duration for verification", "WARNING")
+                return segment_paths, []  # Assume valid if we can't verify
+            
+            valid_segments = []
+            invalid_segments = []
+            total_segment_duration = 0
+            
+            for segment_path in segment_paths:
+                try:
+                    # Check if file exists and has size
+                    segment_file = Path(segment_path)
+                    if not segment_file.exists() or segment_file.stat().st_size == 0:
+                        self.log(f"   Invalid segment (missing/empty): {segment_file.name}", "DEBUG")
+                        invalid_segments.append(segment_path)
+                        continue
+                    
+                    # Check segment video info
+                    segment_info = self.get_video_info(segment_path)
+                    if not segment_info:
+                        self.log(f"   Invalid segment (unreadable): {segment_file.name}", "DEBUG")
+                        invalid_segments.append(segment_path)
+                        continue
+                    
+                    # Check segment duration
+                    segment_duration = float(segment_info.get("format", {}).get("duration", 0))
+                    if segment_duration <= 0:
+                        self.log(f"   Invalid segment (no duration): {segment_file.name}", "DEBUG")
+                        invalid_segments.append(segment_path)
+                        continue
+                    
+                    total_segment_duration += segment_duration
+                    valid_segments.append(segment_path)
+                    self.log(f"   Valid segment: {segment_file.name} ({segment_duration:.1f}s)", "DEBUG")
+                    
+                except Exception as e:
+                    self.log(f"   Error verifying segment {segment_path}: {e}", "DEBUG")
+                    invalid_segments.append(segment_path)
+            
+            # Check if total duration is reasonable (within 5% of source)
+            duration_diff_percent = abs(total_segment_duration - source_duration) / source_duration * 100
+            
+            self.log(f"   Source duration: {source_duration:.1f}s", "DEBUG")
+            self.log(f"   Segments total duration: {total_segment_duration:.1f}s", "DEBUG")
+            self.log(f"   Duration difference: {duration_diff_percent:.1f}%", "DEBUG")
+            
+            if duration_diff_percent > 5:
+                self.log(f"   Warning: Significant duration mismatch ({duration_diff_percent:.1f}%), may need re-segmentation", "WARNING")
+            
+            return valid_segments, invalid_segments
+            
+        except Exception as e:
+            self.log(f"   Error in segment verification: {e}", "WARNING")
+            return segment_paths, []  # Assume valid if verification fails
+    
+    def filter_segments_for_processing(self, segment_paths):
+        """Filter segments to find which need compression and which are already compressed."""
+        segments_to_process = []
+        existing_compressed = []
+        
+        for segment_path in segment_paths:
+            segment_file = Path(segment_path)
+            # Look for compressed version
+            compressed_path = segment_file.parent / f"{segment_file.stem}_compressed{segment_file.suffix}"
+            
+            if compressed_path.exists() and compressed_path.stat().st_size > 0:
+                # Verify the compressed segment is valid
+                try:
+                    compressed_info = self.get_video_info(compressed_path)
+                    if compressed_info and float(compressed_info.get("format", {}).get("duration", 0)) > 0:
+                        existing_compressed.append(str(compressed_path))
+                        self.log(f"   Found valid compressed segment: {compressed_path.name}", "DEBUG")
+                        continue
+                except Exception as e:
+                    self.log(f"   Compressed segment appears invalid: {compressed_path.name} - {e}", "DEBUG")
+            
+            # Need to process this segment
+            segments_to_process.append(segment_path)
+        
+        return segments_to_process, existing_compressed
+
+    def check_existing_compressed_segments(self, source_file):
+        """Check for existing compressed segment files and infer what raw segments should exist.
+        
+        This allows resuming work when we have compressed segments but missing raw segments.
+        
+        Returns:
+            tuple: (inferred_raw_segments, existing_compressed_segments, total_expected_segments)
+        """
+        source_path = Path(source_file)
+        segments_dir = source_path.parent / f"{source_path.stem}_segments"
+        
+        if not segments_dir.exists():
+            self.log(f"   No segments directory found: {segments_dir}", "DEBUG")
+            return [], [], 0
+        
+        # Look for compressed segments
+        compressed_pattern = f"{source_path.stem}_segment_*_compressed{source_path.suffix}"
+        compressed_files = list(segments_dir.glob(compressed_pattern))
+        
+        if not compressed_files:
+            self.log(f"   No existing compressed segments found in {segments_dir}", "DEBUG")
+            return [], [], 0
+        
+        # Sort by segment number and extract segment info
+        compressed_files.sort(key=lambda x: int(x.stem.split('_')[2]))  # Extract segment number
+        existing_compressed = [str(f) for f in compressed_files]
+        
+        # Infer what raw segments should exist based on compressed segments
+        inferred_raw_segments = []
+        segment_numbers = []
+        
+        for compressed_file in compressed_files:
+            # Extract segment number from filename like "video_segment_001_compressed.mov"
+            parts = compressed_file.stem.split('_')
+            segment_num = parts[2]  # Gets "001" from ["video", "segment", "001", "compressed"]
+            segment_numbers.append(int(segment_num))
+            
+            # Infer the corresponding raw segment path
+            raw_segment_name = f"{source_path.stem}_segment_{segment_num}{source_path.suffix}"
+            raw_segment_path = segments_dir / raw_segment_name
+            inferred_raw_segments.append(str(raw_segment_path))
+        
+        # Determine total expected segments based on video duration
+        try:
+            source_info = self.get_video_info(source_file)
+            if source_info:
+                source_duration = float(source_info.get("format", {}).get("duration", 0))
+                segment_duration = self.config.get("segmentation_settings", {}).get("segment_duration_seconds", 600)
+                total_expected_segments = max(1, int((source_duration + segment_duration - 1) // segment_duration))
+            else:
+                # Fall back to using the highest segment number we found
+                total_expected_segments = max(segment_numbers) if segment_numbers else 0
+        except:
+            total_expected_segments = max(segment_numbers) if segment_numbers else 0
+        
+        self.log(f"   Found {len(existing_compressed)} compressed segments", "DEBUG")
+        self.log(f"   Segment numbers: {sorted(segment_numbers)}", "DEBUG")
+        self.log(f"   Expected total segments: {total_expected_segments}", "DEBUG")
+        
+        return inferred_raw_segments, existing_compressed, total_expected_segments
+
+    def get_missing_segment_numbers(self, existing_segment_numbers, total_expected_segments):
+        """Determine which segment numbers are missing from a sequence.
+        
+        Args:
+            existing_segment_numbers: List of segment numbers that exist
+            total_expected_segments: Total number of segments expected
+            
+        Returns:
+            List of missing segment numbers
+        """
+        if total_expected_segments <= 0:
+            return []
+        
+        expected_numbers = set(range(1, total_expected_segments + 1))
+        existing_numbers = set(existing_segment_numbers)
+        missing_numbers = sorted(expected_numbers - existing_numbers)
+        
+        return missing_numbers
 
 
 def main():

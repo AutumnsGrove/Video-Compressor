@@ -194,7 +194,12 @@ def create_interface():
                 return "No files provided. Please upload files or provide file paths."
             
             # Process files with progress tracking
-            progress(0.1, desc=f"Analyzing {len(files_to_process)} files...")
+            # Check if any files need segmentation
+            large_files_count = sum(1 for f in files_to_process if os.path.exists(f) and os.path.getsize(f) > 10*1024**3)
+            if large_files_count > 0:
+                progress(0.1, desc=f"Analyzing {len(files_to_process)} files ({large_files_count} large files detected)...")
+            else:
+                progress(0.1, desc=f"Analyzing {len(files_to_process)} files...")
             
             # Capture output
             output_lines = []
@@ -229,15 +234,30 @@ def create_interface():
                     throughput_mbps = progress_data.get('throughput_mbps', 0.0)
                     eta_seconds = progress_data.get('eta_seconds', 0)
                     
-                    # Create enhanced status message
+                    # Create enhanced status message with segmentation awareness
+                    workers_info = progress_data.get('workers', [])
+                    has_segments = any('segment' in w.get('task_name', '').lower() for w in workers_info)
+                    
                     if active_workers > 0:
-                        if eta_seconds > 0:
-                            eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
-                            status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
+                        if has_segments:
+                            # Segmentation workflow in progress
+                            if eta_seconds > 0:
+                                eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
+                                status_message = f"Large file segmentation: {active_workers}/{total_workers} segments | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
+                            else:
+                                status_message = f"Large file segmentation: {active_workers}/{total_workers} segments | {throughput_mbps:.1f}MB/s"
                         else:
-                            status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s"
+                            # Regular processing
+                            if eta_seconds > 0:
+                                eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
+                                status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
+                            else:
+                                status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s"
                     else:
-                        status_message = f"Processing complete | Total throughput: {throughput_mbps:.1f}MB/s"
+                        if has_segments:
+                            status_message = f"Segmentation complete | Total throughput: {throughput_mbps:.1f}MB/s"
+                        else:
+                            status_message = f"Processing complete | Total throughput: {throughput_mbps:.1f}MB/s"
                     
                     # Map overall progress to 0.2 -> 0.95 range 
                     mapped_progress = 0.2 + (overall_progress * 0.75)

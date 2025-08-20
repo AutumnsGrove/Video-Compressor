@@ -168,6 +168,43 @@ def test_dry_run_functionality():
         print(f"   ❌ Dry run test failed: {e}")
         return False
 
+def test_parallel_conditions():
+    """Test the conditions that determine parallel vs sequential processing."""
+    print("\n🧪 Testing parallel processing conditions...\n")
+    
+    try:
+        processor = ParallelVideoProcessor()
+        
+        # Test the exact condition used in process_segments_parallel
+        test_segments = ["seg1.mov", "seg2.mov", "seg3.mov", "seg4.mov"]
+        
+        print(f"   📋 Test scenario: {len(test_segments)} segments")
+        print(f"   ⚙️  parallel_enabled: {processor.parallel_enabled}")
+        print(f"   ⚙️  segment_parallel: {processor.segment_parallel}")
+        print(f"   ⚙️  max_concurrent_jobs: {processor.max_concurrent_jobs}")
+        
+        # Check the condition from process_segments_parallel
+        will_use_parallel = processor.parallel_enabled and len(test_segments) > 1
+        print(f"   🔍 Condition (parallel_enabled AND len > 1): {will_use_parallel}")
+        
+        if will_use_parallel:
+            expected_workers = min(processor.max_concurrent_jobs, len(test_segments))
+            print(f"   🚀 Should use {expected_workers} parallel workers")
+        else:
+            print(f"   📝 Will fall back to sequential processing")
+            if not processor.parallel_enabled:
+                print(f"     🔴 Reason: parallel_enabled is False")
+            if len(test_segments) <= 1:
+                print(f"     🔴 Reason: only {len(test_segments)} segment(s)")
+        
+        print(f"   ✅ Condition check completed")
+        
+        return True
+        
+    except Exception as e:
+        print(f"   ❌ Parallel conditions test failed: {e}")
+        return False
+
 def run_all_tests():
     """Run all parallel processing tests."""
     print("🚀 Running ParallelVideoProcessor Tests\n" + "="*50)
@@ -177,7 +214,8 @@ def run_all_tests():
         test_config_loading,
         test_fallback_to_sequential,
         test_cpu_core_detection,
-        test_dry_run_functionality
+        test_dry_run_functionality,
+        test_parallel_conditions
     ]
     
     passed = 0
