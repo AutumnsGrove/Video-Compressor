@@ -1784,19 +1784,16 @@ class VideoCompressor:
         input_path = Path(input_path)
         output_path = Path(output_path)
         
-        # Report initial segmentation progress
-        if progress_callback:
-            progress_callback(0.1)  # Starting segmentation
+        # Preserve existing progress aggregator if available, otherwise create new one
+        if not hasattr(self, 'progress_aggregator') or self.progress_aggregator is None:
+            self.progress_aggregator = ProgressAggregator()
         
-        # Reset progress aggregator for this segmentation workflow
-        self.progress_aggregator = ProgressAggregator()
+        # Set callback if provided (this preserves batch-level callbacks)
         if progress_callback:
             self.progress_aggregator.set_callback(progress_callback)
         
         # Step 1: Segment the original video
         self.log(f"📁 Step 1: Segmenting large video file...", "INFO")
-        if progress_callback:
-            progress_callback(0.15)  # Segmentation starting
         
         # Progress callback for segmentation phase (15% to 25%)
         def segmentation_phase_progress(seg_progress):
@@ -1810,8 +1807,6 @@ class VideoCompressor:
             return False, "Failed to segment video file"
         
         self.log(f"✅ Created {len(segment_paths)} segments", "INFO")
-        if progress_callback:
-            progress_callback(0.25)  # Segmentation complete
         
         try:
             # Step 2: Compress segments using parallel processing
@@ -1847,9 +1842,7 @@ class VideoCompressor:
             # Step 3: Merge compressed segments
             self.log(f"🔗 Step 3: Merging {len(compressed_segments)} compressed segments...", "INFO")
             
-            # Update progress for merging phase
-            if progress_callback:
-                progress_callback(0.90)  # 90% complete, starting merge
+            # Merge phase will be tracked by the ProgressAggregator automatically
             
             success, message = self.merge_compressed_segments(compressed_segments, output_path)
             if not success:
@@ -2515,8 +2508,11 @@ class ParallelVideoProcessor(VideoCompressor):
         self.log(f"   Parallel workers: {min(self.max_concurrent_jobs, len(segments))}", "INFO")
         self.log(f"   Output directory: {output_dir}", "DEBUG")
         
-        # Reset progress aggregator for parallel processing
-        self.progress_aggregator = ProgressAggregator()
+        # Preserve existing progress aggregator for parallel processing
+        if not hasattr(self, 'progress_aggregator') or self.progress_aggregator is None:
+            self.progress_aggregator = ProgressAggregator()
+        
+        # Set callback if provided (preserves batch-level callbacks)
         if progress_callback:
             self.progress_aggregator.set_callback(progress_callback)
         
