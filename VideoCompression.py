@@ -52,26 +52,76 @@ class ProgressAggregator:
             self._total_bytes += file_size_bytes
     
     def update_worker_progress(self, worker_id, progress_pct, fps=0.0, processed_bytes=None):
-        """Update progress for a specific worker."""
+        """Update progress for a specific worker with robust type checking."""
         with self._lock:
             if worker_id not in self._workers:
                 return
             
             worker = self._workers[worker_id]
             old_progress = worker['progress_pct']
-            worker['progress_pct'] = min(progress_pct, 1.0)
-            worker['fps'] = fps
+            
+            # Robust type checking for progress_pct - handle dictionary objects
+            if isinstance(progress_pct, dict):
+                # Extract progress percentage from dictionary if available
+                if 'overall_progress' in progress_pct:
+                    progress_value = progress_pct['overall_progress']
+                elif 'progress' in progress_pct:
+                    progress_value = progress_pct['progress']
+                elif 'percent' in progress_pct:
+                    progress_value = progress_pct['percent']
+                else:
+                    # Log warning and use previous value
+                    if hasattr(self, 'log'):
+                        self.log(f"Warning: Progress data for {worker_id} is dict without progress field: {progress_pct}", "WARNING")
+                    progress_value = old_progress
+            elif isinstance(progress_pct, (int, float)) and not isinstance(progress_pct, bool):
+                progress_value = progress_pct
+            else:
+                # Handle invalid types - log and use previous value
+                if hasattr(self, 'log'):
+                    self.log(f"Warning: Invalid progress type for {worker_id}: {type(progress_pct)} = {progress_pct}", "WARNING")
+                progress_value = old_progress
+            
+            # Ensure progress_value is numeric and clamp to valid range
+            try:
+                progress_value = float(progress_value) if progress_value is not None else 0.0
+                progress_value = max(0.0, min(progress_value, 1.0))
+            except (ValueError, TypeError):
+                progress_value = old_progress
+                if hasattr(self, 'log'):
+                    self.log(f"Warning: Could not convert progress to float for {worker_id}, keeping previous: {old_progress}", "WARNING")
+            
+            worker['progress_pct'] = progress_value
+            
+            # Type check fps parameter
+            try:
+                fps_value = float(fps) if isinstance(fps, (int, float)) and not isinstance(fps, bool) else 0.0
+                fps_value = max(0.0, fps_value)  # Ensure non-negative
+            except (ValueError, TypeError):
+                fps_value = 0.0
+            worker['fps'] = fps_value
             worker['last_update'] = time.time()
-            worker['status'] = 'processing' if progress_pct < 1.0 else 'completed'
+            worker['status'] = 'processing' if progress_value < 1.0 else 'completed'
             
             # Calculate processed bytes if not provided
             if processed_bytes is not None:
-                old_processed = worker['processed_bytes']
-                worker['processed_bytes'] = processed_bytes
-                self._processed_bytes += (processed_bytes - old_processed)
-            else:
+                # Type check processed_bytes parameter
+                try:
+                    processed_value = float(processed_bytes) if isinstance(processed_bytes, (int, float)) and not isinstance(processed_bytes, bool) else None
+                    if processed_value is not None and processed_value >= 0:
+                        old_processed = worker['processed_bytes']
+                        worker['processed_bytes'] = processed_value
+                        self._processed_bytes += (processed_value - old_processed)
+                    else:
+                        # Invalid processed_bytes, fall through to estimation
+                        processed_bytes = None
+                except (ValueError, TypeError):
+                    # Invalid processed_bytes, fall through to estimation
+                    processed_bytes = None
+            
+            if processed_bytes is None:
                 # Estimate based on progress percentage
-                new_processed = worker['file_size_bytes'] * progress_pct
+                new_processed = worker['file_size_bytes'] * progress_value
                 old_processed = worker['processed_bytes']
                 worker['processed_bytes'] = new_processed
                 self._processed_bytes += (new_processed - old_processed)
@@ -83,9 +133,9 @@ class ProgressAggregator:
                 worker['throughput_mbps'] = (bytes_processed / (1024 * 1024)) / elapsed
                 
                 # Calculate ETA for this worker
-                if progress_pct > 0.01:
+                if progress_value > 0.01:
                     try:
-                        total_time_est = elapsed / progress_pct
+                        total_time_est = elapsed / progress_value
                         calculated_eta = max(0, total_time_est - elapsed)
                         # Ensure eta_seconds is always a number
                         worker['eta_seconds'] = float(calculated_eta) if isinstance(calculated_eta, (int, float)) else 0.0
