@@ -84,8 +84,13 @@ class ProgressAggregator:
                 
                 # Calculate ETA for this worker
                 if progress_pct > 0.01:
-                    total_time_est = elapsed / progress_pct
-                    worker['eta_seconds'] = max(0, total_time_est - elapsed)
+                    try:
+                        total_time_est = elapsed / progress_pct
+                        calculated_eta = max(0, total_time_est - elapsed)
+                        # Ensure eta_seconds is always a number
+                        worker['eta_seconds'] = float(calculated_eta) if isinstance(calculated_eta, (int, float)) else 0.0
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        worker['eta_seconds'] = 0.0
     
     def get_aggregate_progress(self):
         """Get overall progress across all workers."""
@@ -115,7 +120,15 @@ class ProgressAggregator:
                     active_workers += 1
                 
                 total_throughput += worker['throughput_mbps']
-                max_eta = max(max_eta, worker['eta_seconds'])
+                
+                # Defensive type checking for eta_seconds to prevent comparison errors
+                worker_eta = worker['eta_seconds']
+                if isinstance(worker_eta, (int, float)) and not isinstance(worker_eta, bool):
+                    max_eta = max(max_eta, worker_eta)
+                else:
+                    # Log the issue and reset to 0 if eta_seconds is corrupted
+                    self.log(f"Warning: Worker {worker_id} has invalid eta_seconds type: {type(worker_eta)} = {worker_eta}", "WARNING") if hasattr(self, 'log') else None
+                    worker['eta_seconds'] = 0
                 
                 worker_details.append({
                     'id': worker_id,
@@ -152,6 +165,17 @@ class ProgressAggregator:
                 try:
                     progress_data = self.get_aggregate_progress()
                     self._callback(progress_data)
+                except Exception as e:
+                    # Enhanced error logging with stack trace
+                    import traceback
+                    error_msg = f"Progress callback error: {type(e).__name__}: {str(e)}"
+                    stack_trace = traceback.format_exc()
+                    
+                    # Log to file or console if logger is available
+                    if hasattr(self, 'log'):
+                        self.log(f"{error_msg}\nStack trace:\n{stack_trace}", "ERROR")
+                    else:
+                        print(f"ERROR: {error_msg}\nStack trace:\n{stack_trace}")
                 finally:
                     self._notifying = False
     
@@ -1158,11 +1182,23 @@ class VideoCompressor:
             return True, "Compression successful"
             
         except Exception as e:
-            # Mark worker as failed
-            self.progress_aggregator.fail_worker(worker_id, f"Exception: {type(e).__name__}: {e}")
+            # Enhanced error logging with stack trace and context
+            import traceback
+            stack_trace = traceback.format_exc()
+            error_context = {
+                'input_path': input_path,
+                'output_path': output_path,
+                'worker_id': worker_id,
+                'progress_data': self.progress_aggregator.get_aggregate_progress() if hasattr(self.progress_aggregator, 'get_aggregate_progress') else "N/A"
+            }
             
             error_msg = f"Compression error: {type(e).__name__}: {e}"
-            self.log(f"❌ {error_msg}", "ERROR")
+            detailed_error = f"{error_msg}\nContext: {error_context}\nStack trace:\n{stack_trace}"
+            
+            # Mark worker as failed
+            self.progress_aggregator.fail_worker(worker_id, error_msg)
+            
+            self.log(f"❌ {detailed_error}", "ERROR")
             
             # Add specific troubleshooting for common issues
             if "No space left on device" in str(e):

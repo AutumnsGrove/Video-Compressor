@@ -233,6 +233,9 @@ def create_interface():
                     total_workers = progress_data.get('total_workers', 0)
                     throughput_mbps = progress_data.get('throughput_mbps', 0.0)
                     eta_seconds = progress_data.get('eta_seconds', 0)
+                    # Ensure eta_seconds is a number for calculations
+                    if not isinstance(eta_seconds, (int, float)) or isinstance(eta_seconds, bool):
+                        eta_seconds = 0
                     
                     # Create enhanced status message with segmentation awareness
                     workers_info = progress_data.get('workers', [])
