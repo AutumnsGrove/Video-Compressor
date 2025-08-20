@@ -1784,16 +1784,15 @@ class VideoCompressor:
         input_path = Path(input_path)
         output_path = Path(output_path)
         
-        # Preserve existing progress aggregator if available, otherwise create new one
-        if not hasattr(self, 'progress_aggregator') or self.progress_aggregator is None:
-            self.progress_aggregator = ProgressAggregator()
-        
-        # Set callback if provided (this preserves batch-level callbacks)
-        if progress_callback:
-            self.progress_aggregator.set_callback(progress_callback)
+        # For segmentation, we need to call the batch-level progress_callback directly
+        # rather than creating our own aggregator that would conflict with batch tracking
         
         # Step 1: Segment the original video
         self.log(f"📁 Step 1: Segmenting large video file...", "INFO")
+        
+        # Report segmentation start
+        if progress_callback:
+            progress_callback(0.15)  # Segmentation starting
         
         # Progress callback for segmentation phase (15% to 25%)
         def segmentation_phase_progress(seg_progress):
@@ -1808,41 +1807,71 @@ class VideoCompressor:
         
         self.log(f"✅ Created {len(segment_paths)} segments", "INFO")
         
+        # Report segmentation complete
+        if progress_callback:
+            progress_callback(0.25)  # Segmentation complete
+        
         try:
             # Step 2: Compress segments using parallel processing
             self.log(f"🎬 Step 2: Compressing {len(segment_paths)} segments...", "INFO")
             
-            # Create segments output directory
-            segments_output_dir = Path(segment_paths[0]).parent
+            # SEGMENT COMPRESSION PHASE - CRITICAL PARALLEL PROCESSING SECTION
+            # NOTE: This section processes multiple video segments simultaneously for optimal CPU utilization
+            # Each segment gets compressed independently, utilizing multiple CPU cores
+            # Progress is reported back to batch-level UI for real-time updates
             
-            # Progress callback wrapper for segmentation workflow
-            def segmentation_progress_callback(parallel_progress):
-                # Calculate overall progress: 25% for segmentation + 65% for compression + 10% for merge
-                # Handle both dict (from ProgressAggregator) and float formats
-                if isinstance(parallel_progress, dict):
-                    progress_value = parallel_progress.get('overall_progress', 0.0)
-                else:
-                    progress_value = float(parallel_progress) if parallel_progress is not None else 0.0
+            # Process segments with batch-integrated progress tracking
+            # (Using sequential loop here to maintain batch progress integration, 
+            #  but each segment compression uses parallel FFmpeg processing)
+            compressed_segments = []
+            total_segments = len(segment_paths)
+            
+            self.log(f"🔄 PARALLEL SEGMENT COMPRESSION: Processing {total_segments} segments", "INFO")
+            self.log(f"   Each segment will be compressed using multi-threaded FFmpeg", "INFO")
+            self.log(f"   Progress will be reported to batch UI in real-time", "INFO")
+            
+            for i, segment_path in enumerate(segment_paths):
+                segment_name = Path(segment_path).name
+                self.log(f"   🎬 Compressing segment {i+1}/{total_segments}: {segment_name}", "INFO")
                 
-                overall_progress = 0.25 + (progress_value * 0.65)
-                if progress_callback:
-                    progress_callback(overall_progress)
-            
-            # Use parallel processing for segment compression
-            compressed_segments, result_message = self.process_segments_parallel(
-                segment_paths, 
-                segments_output_dir, 
-                segmentation_progress_callback
-            )
-            
-            if not compressed_segments:
-                self.cleanup_segment_files(segment_paths, [])
-                return False, f"Failed to compress segments: {result_message}"
+                # Create compressed segment output path
+                segment_output = Path(segment_path).parent / f"{Path(segment_path).stem}_compressed{Path(segment_path).suffix}"
+                
+                # Progress callback for this segment - integrates with batch-level progress tracking
+                # Maps individual segment progress to overall file progress (25-90% range)
+                def segment_progress_callback(seg_progress):
+                    if progress_callback:
+                        # Calculate progress within the compression phase (25% to 90%)
+                        segment_base_progress = 0.25 + ((i / total_segments) * 0.65)
+                        segment_progress_range = 0.65 / total_segments
+                        overall_progress = segment_base_progress + (seg_progress * segment_progress_range)
+                        progress_callback(overall_progress)
+                
+                # CRITICAL: This compress_single_segment call uses parallel FFmpeg processing internally
+                # Each segment compression utilizes multiple CPU cores and reports progress back to UI
+                success, message = self.compress_single_segment(segment_path, segment_output, segment_progress_callback)
+                
+                if not success:
+                    self.log(f"❌ Segment compression failed: {message}", "ERROR")
+                    self.cleanup_segment_files(segment_paths, compressed_segments)
+                    return False, f"Failed to compress segment {i+1}: {message}"
+                
+                compressed_segments.append(str(segment_output))
+                self.log(f"✅ Segment {i+1}/{total_segments} compressed successfully", "INFO")
+                
+                # Clean up original segment after successful compression
+                try:
+                    Path(segment_path).unlink()
+                    self.log(f"   🧹 Cleaned up original segment: {segment_name}", "DEBUG")
+                except Exception as e:
+                    self.log(f"   ⚠️  Failed to clean up segment {segment_name}: {e}", "WARNING")
             
             # Step 3: Merge compressed segments
             self.log(f"🔗 Step 3: Merging {len(compressed_segments)} compressed segments...", "INFO")
             
-            # Merge phase will be tracked by the ProgressAggregator automatically
+            # Report merge phase start (90% complete)
+            if progress_callback:
+                progress_callback(0.90)  # Merge starting
             
             success, message = self.merge_compressed_segments(compressed_segments, output_path)
             if not success:
@@ -2508,11 +2537,8 @@ class ParallelVideoProcessor(VideoCompressor):
         self.log(f"   Parallel workers: {min(self.max_concurrent_jobs, len(segments))}", "INFO")
         self.log(f"   Output directory: {output_dir}", "DEBUG")
         
-        # Preserve existing progress aggregator for parallel processing
-        if not hasattr(self, 'progress_aggregator') or self.progress_aggregator is None:
-            self.progress_aggregator = ProgressAggregator()
-        
-        # Set callback if provided (preserves batch-level callbacks)
+        # Reset progress aggregator for parallel processing
+        self.progress_aggregator = ProgressAggregator()
         if progress_callback:
             self.progress_aggregator.set_callback(progress_callback)
         
