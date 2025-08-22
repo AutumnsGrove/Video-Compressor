@@ -519,7 +519,7 @@ class VideoCompressor:
             return None
     
     def get_video_info(self, file_path):
-        """Get detailed video information with enhanced timeout for large files."""
+        """Get detailed video information with enhanced error handling and fallback strategies."""
         file_size_gb = os.path.getsize(file_path) / (1024**3)
         
         # Dynamic timeout based on file size and config
@@ -528,7 +528,8 @@ class VideoCompressor:
         else:
             timeout = 30
         
-        cmd = [
+        # Strategy 1: Standard ffprobe with full stream analysis
+        cmd_full = [
             self.config["ffmpeg_path"].replace("ffmpeg", "ffprobe"),
             "-v", "quiet",
             "-print_format", "json",
@@ -540,20 +541,75 @@ class VideoCompressor:
         self.log(f"🔍 Analyzing video info (timeout: {timeout}s)", "DEBUG")
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(cmd_full, capture_output=True, text=True, timeout=timeout)
             if result.returncode == 0:
                 video_info = json.loads(result.stdout)
                 self.log(f"✅ Video analysis complete", "DEBUG")
                 return video_info
             else:
-                self.log(f"ffprobe error: {result.stderr}", "ERROR")
-                return None
+                self.log(f"ffprobe standard analysis failed: {result.stderr.strip()}", "WARNING")
         except subprocess.TimeoutExpired:
-            self.log(f"ffprobe timeout after {timeout}s for large file", "ERROR")
-            return None
+            self.log(f"ffprobe timeout after {timeout}s for large file", "WARNING")
+        except json.JSONDecodeError as e:
+            self.log(f"ffprobe returned invalid JSON: {e}", "WARNING")
         except Exception as e:
-            self.log(f"Error getting video info: {e}", "ERROR")
-            return None
+            self.log(f"ffprobe standard analysis error: {e}", "WARNING")
+        
+        # Strategy 2: Minimal ffprobe with format-only analysis
+        self.log(f"🔄 Attempting minimal ffprobe analysis...", "DEBUG")
+        cmd_minimal = [
+            self.config["ffmpeg_path"].replace("ffmpeg", "ffprobe"),
+            "-v", "error",  # Reduce verbosity to minimize noise
+            "-print_format", "json",
+            "-show_format",
+            "-select_streams", "v:0",  # Only first video stream
+            str(file_path)
+        ]
+        
+        try:
+            result = subprocess.run(cmd_minimal, capture_output=True, text=True, timeout=timeout)
+            if result.returncode == 0:
+                video_info = json.loads(result.stdout)
+                self.log(f"✅ Minimal video analysis successful", "DEBUG")
+                return video_info
+            else:
+                self.log(f"ffprobe minimal analysis failed: {result.stderr.strip()}", "WARNING")
+        except subprocess.TimeoutExpired:
+            self.log(f"ffprobe minimal timeout after {timeout}s", "WARNING")
+        except json.JSONDecodeError as e:
+            self.log(f"ffprobe minimal returned invalid JSON: {e}", "WARNING")
+        except Exception as e:
+            self.log(f"ffprobe minimal analysis error: {e}", "WARNING")
+        
+        # Strategy 3: Basic file probe with ignore errors
+        self.log(f"🔄 Attempting basic file probe (ignore errors)...", "DEBUG")
+        cmd_basic = [
+            self.config["ffmpeg_path"].replace("ffmpeg", "ffprobe"),
+            "-v", "error",
+            "-print_format", "json",
+            "-show_format",
+            "-ignore_unknown",  # Ignore unknown streams/codecs
+            str(file_path)
+        ]
+        
+        try:
+            result = subprocess.run(cmd_basic, capture_output=True, text=True, timeout=timeout)
+            if result.returncode == 0:
+                video_info = json.loads(result.stdout)
+                self.log(f"✅ Basic file probe successful", "DEBUG")
+                return video_info
+            else:
+                self.log(f"ffprobe basic probe failed: {result.stderr.strip()}", "WARNING")
+        except subprocess.TimeoutExpired:
+            self.log(f"ffprobe basic timeout after {timeout}s", "WARNING")
+        except json.JSONDecodeError as e:
+            self.log(f"ffprobe basic returned invalid JSON: {e}", "WARNING")
+        except Exception as e:
+            self.log(f"ffprobe basic probe error: {e}", "WARNING")
+        
+        # All strategies failed
+        self.log(f"❌ All ffprobe strategies failed for file: {os.path.basename(file_path)}", "ERROR")
+        return None
     
     def get_video_duration(self, video_info):
         """Extract video duration in seconds from video info."""
@@ -571,6 +627,42 @@ class VideoCompressor:
         except (ValueError, KeyError, TypeError):
             pass
         return 0.0
+    
+    def estimate_duration_fallback(self, file_path):
+        """Estimate video duration using file size when ffprobe fails."""
+        try:
+            file_size = os.path.getsize(file_path)
+            file_size_mb = file_size / (1024 * 1024)
+            
+            # Rough estimation based on typical bitrates for different video types
+            # These are conservative estimates for common video formats
+            typical_bitrates = {
+                '.mp4': 5.0,    # 5 Mbps average
+                '.mov': 8.0,    # 8 Mbps average (often higher quality)
+                '.avi': 6.0,    # 6 Mbps average
+                '.mkv': 7.0,    # 7 Mbps average
+                '.webm': 3.0,   # 3 Mbps average (web optimized)
+                '.m4v': 5.0,    # 5 Mbps average
+            }
+            
+            file_ext = Path(file_path).suffix.lower()
+            estimated_bitrate_mbps = typical_bitrates.get(file_ext, 5.0)  # Default 5 Mbps
+            
+            # Duration = file_size_mb / (bitrate_mbps / 8) / 60 (convert to minutes)
+            # Bitrate in Mbps needs to be converted to MB/s by dividing by 8
+            estimated_duration_minutes = file_size_mb / (estimated_bitrate_mbps / 8) / 60
+            estimated_duration_seconds = estimated_duration_minutes * 60
+            
+            self.log(f"📊 Duration estimation fallback:", "DEBUG")
+            self.log(f"   File size: {file_size_mb:.1f}MB", "DEBUG")
+            self.log(f"   Estimated bitrate: {estimated_bitrate_mbps} Mbps", "DEBUG")
+            self.log(f"   Estimated duration: {estimated_duration_minutes:.1f} minutes", "DEBUG")
+            
+            return estimated_duration_seconds
+            
+        except Exception as e:
+            self.log(f"Duration estimation fallback failed: {e}", "WARNING")
+            return 0.0
     
     def verify_file_integrity(self, file_path, original_info=None):
         """Comprehensive file integrity verification with detailed logging."""
@@ -1470,13 +1562,35 @@ class VideoCompressor:
             # Size check
             size_exceeds = file_size_gb > segmentation_threshold_gb
             
-            # Duration check
+            # Duration check with enhanced fallback
             video_info = self.get_video_info(file_path)
             if not video_info:
-                self.log(f"   Cannot get video info - defaulting to size-only check", "WARNING")
-                return size_exceeds
+                self.log(f"   Cannot get video info - using intelligent fallback logic", "WARNING")
+                
+                # Intelligent fallback: larger files are more likely to benefit from segmentation
+                if file_size_gb > segmentation_threshold_gb * 1.5:  # 1.5x threshold
+                    self.log(f"   Large file (>{segmentation_threshold_gb * 1.5:.1f}GB) - recommending segmentation", "INFO")
+                    return True
+                elif file_size_gb > segmentation_threshold_gb:
+                    # Medium-large files: consider file extension as hint
+                    file_ext = Path(file_path).suffix.lower()
+                    if file_ext in ['.mov', '.avi', '.mkv']:  # Often longer formats
+                        self.log(f"   Medium-large {file_ext} file - likely long duration, recommending segmentation", "INFO")
+                        return True
+                    else:
+                        self.log(f"   Medium-large {file_ext} file - unknown duration, using size-only decision", "INFO")
+                        return size_exceeds
+                else:
+                    self.log(f"   File below size threshold - no segmentation needed", "INFO")
+                    return False
             
             duration_seconds = self.get_video_duration(video_info)
+            
+            # If duration is still 0 or invalid, try estimation fallback
+            if duration_seconds <= 0:
+                self.log(f"   Duration not available from metadata, using estimation...", "DEBUG")
+                duration_seconds = self.estimate_duration_fallback(file_path)
+            
             duration_minutes = duration_seconds / 60
             
             self.log(f"   Duration: {duration_minutes:.1f} minutes ({duration_seconds:.1f}s)", "DEBUG")
