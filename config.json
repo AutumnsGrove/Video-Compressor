@@ -36,7 +36,7 @@
   },
   "parallel_processing": {
     "enabled": true,
-    "max_workers": 4,
+    "max_workers": 6,
     "max_workers_limit": 16,
     "segment_parallel": true,
     "small_file_timeout_hours": 2,

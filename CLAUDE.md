@@ -139,6 +139,21 @@ else:
 
 **Solution**: Ensure `process_segments_parallel()` is used instead of sequential loops
 
+### Segment Cleanup Not Working
+**Issue**: Temporary segment files left behind in `.video_segments_temp` directories after compression
+
+**Solution**: Enhanced cleanup logic in parallel workers:
+```python
+# In compress_segment_worker after successful compression:
+try:
+    Path(segment_path).unlink()
+    self.log(f"🧹 [{worker_id}] Cleaned up original segment: {segment_name}", "DEBUG")
+except Exception as cleanup_e:
+    self.log(f"⚠️ [{worker_id}] Failed to clean up segment {segment_name}: {cleanup_e}", "WARNING")
+```
+
+**Additional Enhancement**: Added `_cleanup_segment_directories()` method for thorough directory cleanup
+
 ## Performance Optimization
 
 ### Recommended Settings

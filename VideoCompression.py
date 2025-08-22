@@ -1893,6 +1893,9 @@ class VideoCompressor:
             self.log(f"🧹 Step 5: Cleaning up temporary segment files...", "INFO")
             self.cleanup_segment_files([], compressed_segments)
             
+            # Additional cleanup: Check for any remaining segment directories
+            self._cleanup_segment_directories(input_path)
+            
             # Final progress update
             if progress_callback:
                 progress_callback(1.0)
@@ -2053,6 +2056,50 @@ class VideoCompressor:
                     self.log(f"🧹 Cleaned up empty segment directory: {segment_dir}", "DEBUG")
             except Exception as e:
                 self.log(f"⚠️  Failed to clean up segment directory {segment_dir}: {e}", "WARNING")
+    
+    def _cleanup_segment_directories(self, source_file_path):
+        """Additional cleanup for segment directories that might have leftover files."""
+        source_file_path = Path(source_file_path)
+        source_dir = source_file_path.parent
+        
+        # Look for segment directories near the source file
+        segment_dirs_to_check = [
+            source_dir / ".video_segments_temp",
+            source_dir / "video_segments"
+        ]
+        
+        for segment_dir in segment_dirs_to_check:
+            if not segment_dir.exists():
+                continue
+                
+            try:
+                # First, try to remove any remaining files in the directory
+                removed_files = 0
+                for item in segment_dir.iterdir():
+                    if item.is_file():
+                        item.unlink()
+                        removed_files += 1
+                        self.log(f"   🧹 Removed leftover file: {item.name}", "DEBUG")
+                    elif item.is_dir():
+                        # Remove empty subdirectories
+                        try:
+                            item.rmdir()
+                            self.log(f"   🧹 Removed empty subdirectory: {item.name}", "DEBUG")
+                        except OSError:
+                            self.log(f"   ⚠️  Subdirectory not empty, skipping: {item.name}", "DEBUG")
+                
+                if removed_files > 0:
+                    self.log(f"🧹 Cleaned up {removed_files} leftover files from {segment_dir.name}", "INFO")
+                
+                # Try to remove the main directory if it's empty
+                if not any(segment_dir.iterdir()):
+                    segment_dir.rmdir()
+                    self.log(f"🧹 Removed empty segment directory: {segment_dir}", "INFO")
+                else:
+                    self.log(f"   ⚠️  Segment directory not empty, preserving: {segment_dir}", "WARNING")
+                    
+            except Exception as e:
+                self.log(f"⚠️  Error during directory cleanup for {segment_dir}: {e}", "WARNING")
     
     def get_original_bitrate(self, video_info):
         """Extract original video bitrate from video info."""
@@ -2594,6 +2641,14 @@ class ParallelVideoProcessor(VideoCompressor):
                     # Mark worker as completed in progress aggregator
                     self.progress_aggregator.complete_worker(progress_worker_id)
                     self.log(f"✅ [{worker_id}] Completed segment {segment_index+1}: {segment_name}", "DEBUG")
+                    
+                    # Clean up original segment after successful compression
+                    try:
+                        Path(segment_path).unlink()
+                        self.log(f"   🧹 [{worker_id}] Cleaned up original segment: {segment_name}", "DEBUG")
+                    except Exception as cleanup_e:
+                        self.log(f"   ⚠️  [{worker_id}] Failed to clean up segment {segment_name}: {cleanup_e}", "WARNING")
+                    
                     result = {
                         'type': 'segment_complete',
                         'segment_index': segment_index,
@@ -2967,14 +3022,29 @@ class ParallelVideoProcessor(VideoCompressor):
         return processed_count, failed_count
     
     def _process_large_files_with_segmentation(self, large_files, progress_callback=None):
-        """Process large files using segmentation with optional parallel segment processing."""
+        """Process large files using segmentation with pipeline parallelism for optimal throughput."""
         if not large_files:
             return 0, 0
         
+        # Check if pipeline parallelism is enabled and beneficial
+        pipeline_enabled = (
+            self.segment_parallel and 
+            len(large_files) > 1 and 
+            self.max_concurrent_jobs > 1
+        )
+        
+        if pipeline_enabled:
+            self.log(f"🔧 Processing {len(large_files)} large files with PIPELINE PARALLELISM", "INFO")
+            self.log(f"   🚀 Segmentation and compression will overlap for maximum throughput", "INFO")
+            return self._process_large_files_pipeline(large_files, progress_callback)
+        else:
+            self.log(f"🔧 Processing {len(large_files)} large files with segmentation (sequential)", "INFO")
+            return self._process_large_files_sequential(large_files, progress_callback)
+    
+    def _process_large_files_sequential(self, large_files, progress_callback=None):
+        """Original sequential processing approach for large files."""
         processed_count = 0
         failed_count = 0
-        
-        self.log(f"🔧 Processing {len(large_files)} large files with segmentation", "INFO")
         
         for i, file_path in enumerate(large_files):
             file_name = Path(file_path).name
@@ -3007,6 +3077,302 @@ class ParallelVideoProcessor(VideoCompressor):
                 self.failed_files.append((file_path, error_msg))
         
         self.log(f"✅ Large files phase complete: {processed_count} processed, {failed_count} failed", "INFO")
+        return processed_count, failed_count
+    
+    def _process_large_files_pipeline(self, large_files, progress_callback=None):
+        """Pipeline parallelism: overlap segmentation and compression across multiple files.
+        
+        This approach uses a producer-consumer pattern where:
+        - Producer thread: Segments files and feeds segment queue
+        - Consumer workers: Compress segments from queue as they become available
+        - Allows compression of File A segments while File B is still segmenting
+        """
+        import queue
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        processed_count = 0
+        failed_count = 0
+        
+        # Pipeline control structures
+        segment_queue = queue.Queue(maxsize=50)  # Prevent unlimited memory growth
+        file_status = {}  # Track file processing status
+        pipeline_lock = threading.RLock()
+        
+        # Initialize file tracking
+        for file_path in large_files:
+            file_status[file_path] = {
+                'status': 'pending',  # pending -> segmenting -> segments_complete -> merging -> complete/failed
+                'segments': [],       # List of segment paths
+                'compressed_segments': [],  # List of compressed segment paths
+                'error': None
+            }
+        
+        self.log(f"🚀 PIPELINE INITIALIZATION:", "INFO")
+        self.log(f"   Files to process: {len(large_files)}", "INFO")
+        self.log(f"   Worker threads: {self.max_concurrent_jobs}", "INFO")
+        self.log(f"   Segment queue capacity: 50 segments", "INFO")
+        
+        # Producer function: Segment files and feed queue
+        def segmentation_producer():
+            """Producer thread that segments files and feeds the segment queue."""
+            producer_id = threading.current_thread().name
+            self.log(f"🏭 [{producer_id}] Segmentation producer started", "DEBUG")
+            
+            try:
+                for i, file_path in enumerate(large_files):
+                    file_name = Path(file_path).name
+                    self.log(f"\n🔄 [{producer_id}] Segmenting {i+1}/{len(large_files)}: {file_name}", "INFO")
+                    
+                    with pipeline_lock:
+                        file_status[file_path]['status'] = 'segmenting'
+                    
+                    try:
+                        # Perform segmentation using existing logic
+                        segment_paths = self.segment_video(file_path)
+                        
+                        if segment_paths:
+                            with pipeline_lock:
+                                file_status[file_path]['segments'] = segment_paths
+                                file_status[file_path]['status'] = 'segments_ready'
+                            
+                            self.log(f"✅ [{producer_id}] Segmented {file_name} into {len(segment_paths)} segments", "INFO")
+                            
+                            # Feed segments to queue for consumption
+                            for j, segment_path in enumerate(segment_paths):
+                                segment_job = {
+                                    'type': 'segment',
+                                    'file_path': file_path,
+                                    'segment_path': segment_path,
+                                    'segment_index': j,
+                                    'total_segments': len(segment_paths),
+                                    'file_name': file_name
+                                }
+                                
+                                # Put segment in queue (will block if queue is full)
+                                segment_queue.put(segment_job)
+                                self.log(f"📦 [{producer_id}] Queued segment {j+1}/{len(segment_paths)} for {file_name}", "DEBUG")
+                        else:
+                            # Segmentation failed
+                            with pipeline_lock:
+                                file_status[file_path]['status'] = 'failed'
+                                file_status[file_path]['error'] = 'Segmentation failed'
+                            
+                            self.log(f"❌ [{producer_id}] Segmentation failed for {file_name}", "ERROR")
+                    
+                    except Exception as e:
+                        error_msg = f"Segmentation error: {type(e).__name__}: {e}"
+                        with pipeline_lock:
+                            file_status[file_path]['status'] = 'failed'
+                            file_status[file_path]['error'] = error_msg
+                        
+                        self.log(f"❌ [{producer_id}] Segmentation exception for {file_name}: {error_msg}", "ERROR")
+                
+                # Signal completion to consumers
+                for _ in range(self.max_concurrent_jobs):
+                    segment_queue.put(None)  # Sentinel values to stop workers
+                
+                self.log(f"🏁 [{producer_id}] Segmentation producer completed", "INFO")
+                
+            except Exception as e:
+                error_msg = f"Producer thread error: {type(e).__name__}: {e}"
+                self.log(f"❌ [{producer_id}] {error_msg}", "ERROR")
+                
+                # Emergency stop: send sentinel values
+                try:
+                    for _ in range(self.max_concurrent_jobs):
+                        segment_queue.put(None, timeout=1)
+                except:
+                    pass
+        
+        # Consumer function: Process segments from queue
+        def segment_consumer_worker():
+            """Consumer worker that processes segments from the queue."""
+            worker_id = threading.current_thread().name
+            self.log(f"🔧 [{worker_id}] Segment consumer started", "DEBUG")
+            
+            processed_segments = 0
+            
+            try:
+                while True:
+                    # Get segment job from queue
+                    try:
+                        segment_job = segment_queue.get(timeout=30)  # 30 second timeout
+                    except queue.Empty:
+                        self.log(f"⏰ [{worker_id}] Queue timeout, stopping worker", "DEBUG")
+                        break
+                    
+                    # Check for sentinel (stop signal)
+                    if segment_job is None:
+                        self.log(f"🛑 [{worker_id}] Received stop signal", "DEBUG")
+                        segment_queue.task_done()
+                        break
+                    
+                    # Process segment
+                    file_path = segment_job['file_path']
+                    segment_path = segment_job['segment_path']
+                    segment_index = segment_job['segment_index']
+                    total_segments = segment_job['total_segments']
+                    file_name = segment_job['file_name']
+                    
+                    self.log(f"🎬 [{worker_id}] Processing segment {segment_index+1}/{total_segments} from {file_name}", "DEBUG")
+                    
+                    try:
+                        # Create output path for compressed segment
+                        segment_path_obj = Path(segment_path)
+                        output_dir = segment_path_obj.parent
+                        output_path = output_dir / f"{segment_path_obj.stem}_compressed{segment_path_obj.suffix}"
+                        
+                        # Compress segment using existing method
+                        success, message = self.compress_single_segment(segment_path, output_path)
+                        
+                        if success:
+                            # Add to compressed segments list
+                            with pipeline_lock:
+                                file_status[file_path]['compressed_segments'].append(str(output_path))
+                            
+                            # Clean up original segment
+                            try:
+                                Path(segment_path).unlink()
+                                self.log(f"🧹 [{worker_id}] Cleaned up original segment: {segment_path_obj.name}", "DEBUG")
+                            except Exception as cleanup_e:
+                                self.log(f"⚠️ [{worker_id}] Failed to clean up segment: {cleanup_e}", "WARNING")
+                            
+                            processed_segments += 1
+                            self.log(f"✅ [{worker_id}] Completed segment {segment_index+1}/{total_segments} from {file_name}", "DEBUG")
+                        else:
+                            self.log(f"❌ [{worker_id}] Failed to compress segment {segment_index+1} from {file_name}: {message}", "ERROR")
+                    
+                    except Exception as e:
+                        error_msg = f"Segment processing error: {type(e).__name__}: {e}"
+                        self.log(f"❌ [{worker_id}] Exception processing segment: {error_msg}", "ERROR")
+                    
+                    finally:
+                        segment_queue.task_done()
+                
+                self.log(f"🏁 [{worker_id}] Consumer completed, processed {processed_segments} segments", "DEBUG")
+            
+            except Exception as e:
+                error_msg = f"Consumer worker error: {type(e).__name__}: {e}"
+                self.log(f"❌ [{worker_id}] {error_msg}", "ERROR")
+        
+        # Start pipeline threads
+        self.log(f"🚀 Starting pipeline threads...", "INFO")
+        
+        # Start producer thread
+        producer_thread = threading.Thread(
+            target=segmentation_producer, 
+            name="SegmentationProducer",
+            daemon=True
+        )
+        producer_thread.start()
+        
+        # Start consumer worker threads
+        consumer_threads = []
+        with ThreadPoolExecutor(
+            max_workers=self.max_concurrent_jobs, 
+            thread_name_prefix="SegmentConsumer"
+        ) as executor:
+            # Submit consumer workers
+            consumer_futures = [
+                executor.submit(segment_consumer_worker) 
+                for _ in range(self.max_concurrent_jobs)
+            ]
+            
+            # Wait for producer to complete
+            producer_thread.join()
+            self.log(f"📋 Producer thread completed, waiting for consumers...", "INFO")
+            
+            # Wait for all consumer workers to complete
+            for future in as_completed(consumer_futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    self.log(f"❌ Consumer worker exception: {e}", "ERROR")
+        
+        # Wait for queue to be fully processed
+        segment_queue.join()
+        
+        # Post-processing: Merge compressed segments for each file
+        self.log(f"\n🔗 PIPELINE POST-PROCESSING: Merging compressed segments", "INFO")
+        
+        for file_path in large_files:
+            file_name = Path(file_path).name
+            status = file_status[file_path]
+            
+            if status['status'] == 'failed':
+                self.log(f"❌ Skipping merge for failed file: {file_name} ({status['error']})", "ERROR")
+                failed_count += 1
+                self.failed_files.append((file_path, status['error']))
+                continue
+            
+            # Check if we have compressed segments to merge
+            compressed_segments = status['compressed_segments']
+            if not compressed_segments:
+                error_msg = "No compressed segments available for merging"
+                self.log(f"❌ Merge failed for {file_name}: {error_msg}", "ERROR")
+                failed_count += 1
+                self.failed_files.append((file_path, error_msg))
+                continue
+            
+            try:
+                # Create final output path
+                file_path_obj = Path(file_path)
+                output_path = file_path_obj.parent / f"{file_path_obj.stem}_compressed{file_path_obj.suffix}"
+                
+                # Merge segments
+                self.log(f"🔗 Merging {len(compressed_segments)} segments for {file_name}", "INFO")
+                merge_success, merge_message = self.merge_compressed_segments(compressed_segments, output_path)
+                
+                if merge_success:
+                    # Verify final file
+                    original_info = self.get_video_info(file_path)
+                    integrity_ok, integrity_msg = self.verify_file_integrity(output_path, original_info)
+                    
+                    if integrity_ok:
+                        processed_count += 1
+                        self.processed_files.append(file_path)
+                        self.log(f"✅ Pipeline processing complete for {file_name}", "INFO")
+                        
+                        # Clean up original file if configured
+                        if self.config["safety_settings"].get("delete_original_after_compression", True):
+                            try:
+                                Path(file_path).unlink()
+                                self.log(f"🧹 Deleted original file: {file_name}", "INFO")
+                            except Exception as e:
+                                self.log(f"⚠️ Failed to delete original {file_name}: {e}", "WARNING")
+                    else:
+                        failed_count += 1
+                        self.failed_files.append((file_path, f"Integrity verification failed: {integrity_msg}"))
+                        self.log(f"❌ Integrity verification failed for {file_name}: {integrity_msg}", "ERROR")
+                else:
+                    failed_count += 1
+                    self.failed_files.append((file_path, f"Merge failed: {merge_message}"))
+                    self.log(f"❌ Merge failed for {file_name}: {merge_message}", "ERROR")
+            
+            except Exception as e:
+                error_msg = f"Post-processing error: {type(e).__name__}: {e}"
+                failed_count += 1
+                self.failed_files.append((file_path, error_msg))
+                self.log(f"❌ Post-processing exception for {file_name}: {error_msg}", "ERROR")
+            
+            finally:
+                # Clean up compressed segments
+                for compressed_segment in compressed_segments:
+                    try:
+                        if Path(compressed_segment).exists():
+                            Path(compressed_segment).unlink()
+                    except Exception as e:
+                        self.log(f"⚠️ Failed to clean up compressed segment {compressed_segment}: {e}", "WARNING")
+        
+        self.log(f"\n🏁 PIPELINE PROCESSING COMPLETE", "INFO")
+        self.log(f"   Files processed: {processed_count}", "INFO")
+        self.log(f"   Files failed: {failed_count}", "INFO")
+        
+        # Update progress callback
+        if progress_callback:
+            progress_callback(1.0)
+        
         return processed_count, failed_count
     
     def _process_large_file_with_parallel_segments(self, file_path):
@@ -3222,6 +3588,9 @@ class ParallelVideoProcessor(VideoCompressor):
             # Step 7: Clean up segment files
             self.log(f"🧹 Step 6: Cleaning up temporary files...", "INFO")
             self.cleanup_segment_files(all_segment_paths, compressed_segments)
+            
+            # Additional cleanup: Check for any remaining segment directories
+            self._cleanup_segment_directories(file_path)
             
             self.log(f"✅ PARALLEL LARGE FILE PROCESSING COMPLETE", "INFO")
             return True, f"Large file processed successfully with parallel segments. Saved {space_saved / (1024**3):.2f}GB"
