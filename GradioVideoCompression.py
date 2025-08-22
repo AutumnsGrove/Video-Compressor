@@ -136,7 +136,7 @@ def create_interface():
             
             return paths if paths else [single_line]
     
-    def process_videos_ui(file_paths_input, video_files, dry_run, 
+    def process_videos_ui(file_paths_input, video_files, dry_run, debug_output,
                          target_bitrate_reduction, preserve_10bit, preserve_metadata,
                          video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb, 
                          delete_original, progress=gr.Progress()):
@@ -365,9 +365,17 @@ def create_interface():
                 
                 summary += "\n## 📋 Processing Details:\n"
                 
-                # Show important messages first, then recent activity
-                important_msgs = ui_logger.important_lines[-20:] if hasattr(ui_logger, 'important_lines') else []
-                recent_msgs = output_lines[-30:]
+                # Show more comprehensive output for multiple files
+                important_msgs = ui_logger.important_lines[-50:] if hasattr(ui_logger, 'important_lines') else []
+                
+                # Filter DEBUG messages based on user preference
+                if debug_output:
+                    # Show all messages including DEBUG
+                    recent_msgs = output_lines[-150:]  # Show more lines when debug is enabled
+                else:
+                    # Filter out DEBUG messages for cleaner output
+                    filtered_msgs = [msg for msg in output_lines if not msg.startswith('[DEBUG]')]
+                    recent_msgs = filtered_msgs[-100:]  # Show plenty of non-debug messages
                 
                 if important_msgs:
                     summary += "\n### 🎯 Key Messages:\n"
@@ -459,6 +467,12 @@ def create_interface():
                     value=True, 
                     label="🧪 Dry Run Mode",
                     info="Preview operations without actually processing files"
+                )
+                
+                debug_output = gr.Checkbox(
+                    value=False, 
+                    label="🐛 Debug Output",
+                    info="Show detailed DEBUG logs in processing results"
                 )
                 
                 gr.Markdown("### ⚠️ Safety Features")
@@ -572,7 +586,7 @@ def create_interface():
         process_btn.click(
             fn=process_videos_ui,
             inputs=[
-                file_paths_input, video_input, dry_run,
+                file_paths_input, video_input, dry_run, debug_output,
                 target_bitrate_reduction, preserve_10bit, preserve_metadata,
                 video_codec, preset, crf, enable_hardware_acceleration, min_free_space_gb,
                 delete_original

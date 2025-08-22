@@ -2521,11 +2521,18 @@ class VideoCompressor:
                 
                 self.progress_aggregator.register_worker(worker_id, task_name, original_size, segment_info)
         
-        # Enhanced dry run simulation with worker allocation
+        # Enhanced dry run simulation with worker allocation  
         if dry_run:
             self.log("\n🧪 [DRY RUN] Enhanced Processing Simulation:")
-            large_files = [f for f in file_list if Path(f).exists() and self.should_segment_file(f)]
-            small_files = [f for f in file_list if Path(f).exists() and not self.should_segment_file(f)]
+            
+            # Cache segmentation decisions to avoid duplicate calls
+            segmentation_cache = {}
+            for f in file_list:
+                if Path(f).exists():
+                    segmentation_cache[f] = self.should_segment_file(f)
+            
+            large_files = [f for f, should_segment in segmentation_cache.items() if should_segment]
+            small_files = [f for f, should_segment in segmentation_cache.items() if not should_segment]
             
             if large_files:
                 self.log(f"🔥 Large files detected ({len(large_files)}):")
