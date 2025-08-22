@@ -3208,10 +3208,21 @@ class ParallelVideoProcessor(VideoCompressor):
         processed_count = 0
         failed_count = 0
         
-        # Pipeline control structures
-        segment_queue = queue.Queue(maxsize=50)  # Prevent unlimited memory growth
+        # Pipeline control structures with enhanced tracking
+        # Adaptive queue sizing based on system resources and file count
+        queue_size = min(50, max(10, len(large_files) * 5))  # 5-50 segments based on file count
+        segment_queue = queue.Queue(maxsize=queue_size)
         file_status = {}  # Track file processing status
         pipeline_lock = threading.RLock()
+        
+        # Enhanced progress tracking
+        pipeline_progress = {
+            'total_files': len(large_files),
+            'files_segmented': 0,
+            'total_segments': 0,
+            'segments_compressed': 0,
+            'files_completed': 0
+        }
         
         # Initialize file tracking
         for file_path in large_files:
@@ -3225,7 +3236,7 @@ class ParallelVideoProcessor(VideoCompressor):
         self.log(f"🚀 PIPELINE INITIALIZATION:", "INFO")
         self.log(f"   Files to process: {len(large_files)}", "INFO")
         self.log(f"   Worker threads: {self.max_concurrent_jobs}", "INFO")
-        self.log(f"   Segment queue capacity: 50 segments", "INFO")
+        self.log(f"   Segment queue capacity: {queue_size} segments (adaptive)", "INFO")
         
         # Producer function: Segment files and feed queue
         def segmentation_producer():
@@ -3249,8 +3260,15 @@ class ParallelVideoProcessor(VideoCompressor):
                             with pipeline_lock:
                                 file_status[file_path]['segments'] = segment_paths
                                 file_status[file_path]['status'] = 'segments_ready'
+                                pipeline_progress['files_segmented'] += 1
+                                pipeline_progress['total_segments'] += len(segment_paths)
                             
                             self.log(f"✅ [{producer_id}] Segmented {file_name} into {len(segment_paths)} segments", "INFO")
+                            
+                            # Update progress callback with segmentation progress
+                            if progress_callback:
+                                segmentation_progress = pipeline_progress['files_segmented'] / pipeline_progress['total_files'] * 0.2  # 20% for segmentation
+                                progress_callback(segmentation_progress)
                             
                             # Feed segments to queue for consumption
                             for j, segment_path in enumerate(segment_paths):
@@ -3353,7 +3371,21 @@ class ParallelVideoProcessor(VideoCompressor):
                                 self.log(f"⚠️ [{worker_id}] Failed to clean up segment: {cleanup_e}", "WARNING")
                             
                             processed_segments += 1
-                            self.log(f"✅ [{worker_id}] Completed segment {segment_index+1}/{total_segments} from {file_name}", "DEBUG")
+                            
+                            # Update global progress tracking
+                            with pipeline_lock:
+                                pipeline_progress['segments_compressed'] += 1
+                                
+                                # Calculate compression progress (20% to 90% of total)
+                                if pipeline_progress['total_segments'] > 0:
+                                    compression_progress = (pipeline_progress['segments_compressed'] / pipeline_progress['total_segments']) * 0.7  # 70% for compression
+                                    total_progress = 0.2 + compression_progress  # Add 20% from segmentation
+                                    
+                                    # Update progress callback every 5% or significant milestones
+                                    if progress_callback and (pipeline_progress['segments_compressed'] % max(1, pipeline_progress['total_segments'] // 20) == 0):
+                                        progress_callback(min(0.9, total_progress))  # Cap at 90% (final 10% for merging)
+                            
+                            self.log(f"✅ [{worker_id}] Completed segment {segment_index+1}/{total_segments} from {file_name} [{pipeline_progress['segments_compressed']}/{pipeline_progress['total_segments']} total]", "DEBUG")
                         else:
                             self.log(f"❌ [{worker_id}] Failed to compress segment {segment_index+1} from {file_name}: {message}", "ERROR")
                     
@@ -3410,7 +3442,9 @@ class ParallelVideoProcessor(VideoCompressor):
         # Post-processing: Merge compressed segments for each file
         self.log(f"\n🔗 PIPELINE POST-PROCESSING: Merging compressed segments", "INFO")
         
-        for file_path in large_files:
+        merge_progress_base = 0.9  # Start merging progress at 90%
+        
+        for file_index, file_path in enumerate(large_files):
             file_name = Path(file_path).name
             status = file_status[file_path]
             
@@ -3446,6 +3480,11 @@ class ParallelVideoProcessor(VideoCompressor):
                     if integrity_ok:
                         processed_count += 1
                         self.processed_files.append(file_path)
+                        
+                        # Update progress tracking for completed file
+                        with pipeline_lock:
+                            pipeline_progress['files_completed'] += 1
+                        
                         self.log(f"✅ Pipeline processing complete for {file_name}", "INFO")
                         
                         # Clean up original file if configured
@@ -3478,6 +3517,11 @@ class ParallelVideoProcessor(VideoCompressor):
                             Path(compressed_segment).unlink()
                     except Exception as e:
                         self.log(f"⚠️ Failed to clean up compressed segment {compressed_segment}: {e}", "WARNING")
+                
+                # Update merging progress (90% to 100%)
+                if progress_callback:
+                    merge_progress = merge_progress_base + ((file_index + 1) / len(large_files)) * 0.1
+                    progress_callback(merge_progress)
         
         self.log(f"\n🏁 PIPELINE PROCESSING COMPLETE", "INFO")
         self.log(f"   Files processed: {processed_count}", "INFO")
