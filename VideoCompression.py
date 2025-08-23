@@ -131,6 +131,73 @@ class WorkerGenerator:
         self.active = False
 
 
+class CompressionAnalytics:
+    """Tracks compression efficiency metrics and performance data."""
+    
+    def __init__(self):
+        self.compression_stats = {
+            'total_files_processed': 0,
+            'total_size_reduction': 0,
+            'average_compression_ratio': 0.0,
+            'processing_time_seconds': 0.0,
+            'throughput_mbps': 0.0,
+            'efficiency_score': 0.0
+        }
+        self.session_start_time = time.time()
+        self.file_metrics = []
+    
+    def track_compression(self, original_size, compressed_size, processing_time, file_path):
+        """Track metrics for a single file compression."""
+        size_reduction = original_size - compressed_size
+        compression_ratio = compressed_size / original_size if original_size > 0 else 1.0
+        throughput = (original_size / (1024 * 1024)) / max(processing_time, 0.1)  # MB/s
+        
+        # Update aggregate stats
+        self.compression_stats['total_files_processed'] += 1
+        self.compression_stats['total_size_reduction'] += size_reduction
+        self.compression_stats['processing_time_seconds'] += processing_time
+        
+        # Recalculate averages
+        total_files = self.compression_stats['total_files_processed']
+        self.compression_stats['average_compression_ratio'] = sum(
+            metric['compression_ratio'] for metric in self.file_metrics
+        ) / total_files if total_files > 0 else 1.0
+        
+        # Calculate overall throughput
+        total_time = time.time() - self.session_start_time
+        total_size_mb = sum(metric['original_size'] for metric in self.file_metrics) / (1024 * 1024)
+        self.compression_stats['throughput_mbps'] = total_size_mb / max(total_time, 0.1)
+        
+        # Store individual file metrics
+        file_metric = {
+            'file_path': str(file_path),
+            'original_size': original_size,
+            'compressed_size': compressed_size,
+            'size_reduction': size_reduction,
+            'compression_ratio': compression_ratio,
+            'processing_time': processing_time,
+            'throughput_mbps': throughput,
+            'timestamp': time.time()
+        }
+        self.file_metrics.append(file_metric)
+        
+        # Calculate efficiency score (combination of compression ratio and speed)
+        efficiency = (1 - compression_ratio) * (min(throughput / 10, 1.0))  # Normalized efficiency
+        self.compression_stats['efficiency_score'] = sum(
+            metric.get('efficiency', 0) for metric in self.file_metrics
+        ) / total_files if total_files > 0 else 0.0
+        
+        return file_metric
+    
+    def get_summary(self):
+        """Get comprehensive analytics summary."""
+        return {
+            'stats': self.compression_stats.copy(),
+            'recent_files': self.file_metrics[-5:] if self.file_metrics else [],
+            'session_duration': time.time() - self.session_start_time
+        }
+
+
 class GeneratorWorkerManager:
     """Manages generator-based workers for efficient task distribution."""
     
