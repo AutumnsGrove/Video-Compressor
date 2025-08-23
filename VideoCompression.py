@@ -20,6 +20,241 @@ import re
 import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
+import statistics
+
+class WorkerGenerator:
+    """Generator-based worker system for efficient task processing and worker reuse."""
+    
+    def __init__(self, worker_id, compressor_instance):
+        self.worker_id = worker_id
+        self.compressor = compressor_instance
+        self.active = True
+        self.tasks_completed = 0
+        
+    def segment_compression_generator(self):
+        """Generator that yields segment compression results efficiently."""
+        while self.active:
+            try:
+                # Wait for task from queue (this will be yielded to)
+                task = yield
+                if task is None:  # Shutdown signal
+                    break
+                    
+                self.tasks_completed += 1
+                segment_path = task['segment_path']
+                segment_index = task['segment_index']
+                total_segments = task['total_segments']
+                file_path = task['file_path']
+                
+                self.compressor.log(f"🎬 [{self.worker_id}] Processing segment {segment_index+1}/{total_segments}", "DEBUG")
+                
+                # Create output path for compressed segment
+                segment_path_obj = Path(segment_path)
+                output_dir = segment_path_obj.parent
+                output_path = output_dir / f"{segment_path_obj.stem}_compressed{segment_path_obj.suffix}"
+                
+                # Get video info and settings for compression
+                original_info = self.compressor.get_video_info(file_path)
+                settings = self.compressor.get_compression_settings()
+                
+                # Compress the segment
+                success, message = self.compressor.compress_single_file(
+                    segment_path, output_path, original_info, settings, 
+                    progress_callback=lambda p: None  # Individual segment progress
+                )
+                
+                # Clean up original segment if successful
+                if success:
+                    try:
+                        Path(segment_path).unlink()
+                        self.compressor.log(f"🧹 [{self.worker_id}] Cleaned up original segment: {segment_path_obj.name}", "DEBUG")
+                    except Exception as cleanup_e:
+                        self.compressor.log(f"⚠️ [{self.worker_id}] Failed to clean up segment: {cleanup_e}", "WARNING")
+                
+                # Yield result back to caller
+                yield {
+                    'success': success,
+                    'segment_path': segment_path,
+                    'output_path': output_path,
+                    'message': message,
+                    'worker_id': self.worker_id,
+                    'tasks_completed': self.tasks_completed
+                }
+                
+            except Exception as e:
+                error_msg = f"Generator worker error: {type(e).__name__}: {e}"
+                self.compressor.log(f"❌ [{self.worker_id}] {error_msg}", "ERROR")
+                yield {
+                    'success': False,
+                    'error': error_msg,
+                    'worker_id': self.worker_id
+                }
+    
+    def small_file_generator(self):
+        """Generator for processing small files efficiently.""" 
+        while self.active:
+            try:
+                # Wait for task from queue
+                task = yield
+                if task is None:  # Shutdown signal
+                    break
+                    
+                self.tasks_completed += 1
+                file_path = task['file_path']
+                file_name = Path(file_path).name
+                
+                self.compressor.log(f"🎬 [{self.worker_id}] Processing small file: {file_name}", "DEBUG")
+                
+                # Process the file using existing compression logic
+                success, message = self.compressor.compress_video(file_path)
+                
+                yield {
+                    'success': success,
+                    'file_path': file_path,
+                    'message': message,
+                    'worker_id': self.worker_id,
+                    'tasks_completed': self.tasks_completed
+                }
+                
+            except Exception as e:
+                error_msg = f"Small file generator error: {type(e).__name__}: {e}"
+                self.compressor.log(f"❌ [{self.worker_id}] {error_msg}", "ERROR")
+                yield {
+                    'success': False,
+                    'file_path': task.get('file_path', 'unknown'),
+                    'error': error_msg,
+                    'worker_id': self.worker_id
+                }
+    
+    def shutdown(self):
+        """Signal the generator to shutdown gracefully."""
+        self.active = False
+
+
+class GeneratorWorkerManager:
+    """Manages generator-based workers for efficient task distribution."""
+    
+    def __init__(self, compressor_instance, max_workers=None):
+        self.compressor = compressor_instance
+        self.max_workers = max_workers or compressor_instance.max_concurrent_jobs
+        self.generators = {}
+        self.active_generators = []
+        
+    def create_segment_workers(self):
+        """Create and initialize segment compression generator workers."""
+        self.active_generators = []
+        for i in range(self.max_workers):
+            worker_id = f"GenWorker-{i+1}"
+            worker = WorkerGenerator(worker_id, self.compressor)
+            generator = worker.segment_compression_generator()
+            next(generator)  # Initialize generator (first yield)
+            
+            self.generators[worker_id] = {
+                'worker': worker,
+                'generator': generator,
+                'type': 'segment'
+            }
+            self.active_generators.append(worker_id)
+            
+        self.compressor.log(f"🚀 Created {len(self.active_generators)} generator-based segment workers", "INFO")
+    
+    def process_segments_with_generators(self, segment_tasks, progress_callback=None, max_retries=2):
+        """Process segments using reusable generator workers with enhanced error recovery."""
+        completed_segments = []
+        failed_segments = []
+        retry_queue = []  # Tasks that need to be retried
+        
+        # Create workers if not already created
+        if not self.active_generators:
+            self.create_segment_workers()
+        
+        # Distribute tasks among generators with retry tracking
+        task_queue = [(task, 0) for task in segment_tasks]  # (task, retry_count)
+        worker_index = 0
+        
+        while task_queue or retry_queue or any(gen['generator'] for gen in self.generators.values()):
+            # Process retry queue first
+            if retry_queue and not task_queue:
+                task_queue = retry_queue[:]
+                retry_queue.clear()
+                self.compressor.log(f"🔄 Processing {len(task_queue)} retry tasks", "INFO")
+            
+            # Assign tasks to available generators
+            for worker_id in self.active_generators[:]:  # Copy list to allow modification
+                if not task_queue:
+                    break
+                    
+                generator_info = self.generators[worker_id]
+                generator = generator_info['generator']
+                
+                try:
+                    # Send task to generator
+                    task_data, retry_count = task_queue.pop(0)
+                    result = generator.send(task_data)
+                    
+                    # Process result with retry logic
+                    if result['success']:
+                        completed_segments.append(result['output_path'])
+                        self.compressor.log(f"✅ Generator completed segment: {Path(result['segment_path']).name}", "DEBUG")
+                    else:
+                        if retry_count < max_retries:
+                            # Add to retry queue
+                            retry_queue.append((task_data, retry_count + 1))
+                            self.compressor.log(f"🔄 Retrying segment {Path(result['segment_path']).name} (attempt {retry_count + 2}/{max_retries + 1})", "WARNING")
+                        else:
+                            # Max retries exceeded
+                            failed_segments.append({
+                                'segment_path': result['segment_path'],
+                                'error': f"Max retries ({max_retries}) exceeded: {result.get('message', 'Unknown error')}"
+                            })
+                            self.compressor.log(f"❌ Generator permanently failed segment after {max_retries} retries: {result.get('message', 'Unknown error')}", "ERROR")
+                    
+                    # Update progress accounting for retries
+                    if progress_callback:
+                        total_processed = len(completed_segments) + len(failed_segments)
+                        total_tasks = len(segment_tasks)
+                        remaining_retries = len(retry_queue)
+                        # Provide detailed progress info
+                        progress_info = {
+                            'completed': len(completed_segments),
+                            'failed': len(failed_segments),
+                            'retries_pending': remaining_retries,
+                            'total_tasks': total_tasks,
+                            'progress': total_processed / total_tasks if total_tasks > 0 else 0
+                        }
+                        try:
+                            progress_callback(progress_info['progress'])
+                        except TypeError:
+                            # Fallback for simple progress callbacks
+                            progress_callback(total_processed / total_tasks if total_tasks > 0 else 0)
+                        
+                except StopIteration:
+                    # Generator exhausted, remove from active list
+                    self.active_generators.remove(worker_id)
+                    self.compressor.log(f"🏁 Generator {worker_id} completed all tasks", "DEBUG")
+                except Exception as e:
+                    self.compressor.log(f"❌ Generator {worker_id} error: {e}", "ERROR")
+                    self.active_generators.remove(worker_id)
+        
+        return completed_segments, failed_segments
+    
+    def shutdown_all(self):
+        """Shutdown all generator workers gracefully."""
+        for worker_id, generator_info in self.generators.items():
+            try:
+                worker = generator_info['worker']
+                generator = generator_info['generator']
+                worker.shutdown()
+                generator.send(None)  # Send shutdown signal
+            except (StopIteration, GeneratorExit):
+                pass  # Expected when shutting down
+            except Exception as e:
+                self.compressor.log(f"⚠️ Error shutting down generator {worker_id}: {e}", "WARNING")
+        
+        self.generators.clear()
+        self.active_generators.clear()
+        self.compressor.log(f"🔚 All generator workers shutdown", "INFO")
+
 
 class ProgressAggregator:
     """Thread-safe progress aggregator for complex video processing workflows."""
@@ -33,6 +268,14 @@ class ProgressAggregator:
         self._callback = None
         self._notifying = False  # Prevent recursion in callback notifications
         self._last_callback_time = 0  # Throttle callback frequency
+        
+        # Enhanced tracking for Stage 3
+        self._active_thread_count = 0  # Actual active ThreadPoolExecutor workers
+        self._total_thread_count = 0   # Total ThreadPoolExecutor workers
+        self._queue_size = 0           # Remaining tasks in queue
+        self._total_queue_size = 0     # Initial queue size
+        self._current_file_index = 0   # Current file being processed
+        self._total_files = 0          # Total files to process
         
         # Get callback interval from config or use default
         if config and 'large_file_settings' in config:
@@ -203,13 +446,18 @@ class ProgressAggregator:
             
             return {
                 'overall_progress': total_weighted_progress,
-                'active_workers': active_workers,
-                'total_workers': len(self._workers),
+                'active_workers': max(active_workers, self._active_thread_count),
+                'total_workers': max(len(self._workers), self._total_thread_count),
                 'throughput_mbps': total_throughput,
                 'eta_seconds': max_eta,
                 'workers': worker_details,
                 'total_bytes': self._total_bytes,
-                'processed_bytes': self._processed_bytes
+                'processed_bytes': self._processed_bytes,
+                'queue_size': self._queue_size,
+                'total_queue_size': self._total_queue_size,
+                'current_file': self._current_file_index,
+                'total_files': self._total_files,
+                'actual_thread_count': self._active_thread_count
             }
     
     def set_callback(self, callback):
@@ -242,6 +490,24 @@ class ProgressAggregator:
                         print(f"ERROR: {error_msg}\nStack trace:\n{stack_trace}")
                 finally:
                     self._notifying = False
+    
+    def set_thread_pool_info(self, active_count, total_count):
+        """Update thread pool worker count information."""
+        with self._lock:
+            self._active_thread_count = active_count
+            self._total_thread_count = total_count
+    
+    def set_queue_info(self, current_size, total_size):
+        """Update queue size information."""
+        with self._lock:
+            self._queue_size = current_size
+            self._total_queue_size = total_size
+    
+    def set_file_progress_info(self, current_file, total_files):
+        """Update file processing progress information."""
+        with self._lock:
+            self._current_file_index = current_file
+            self._total_files = total_files
     
     def complete_worker(self, worker_id):
         """Mark a worker as completed."""
@@ -2679,6 +2945,12 @@ class ParallelVideoProcessor(VideoCompressor):
         cpu_cores = cpu_count()
         self.max_concurrent_jobs = min(max_workers_config, cpu_cores)
         
+        # Initialize Stage 3 generator-based worker system
+        self.generator_manager = GeneratorWorkerManager(self, self.max_concurrent_jobs)
+        
+        # Initialize compression analytics
+        self.analytics = CompressionAnalytics()
+        
         # Ensure at least 1 worker but cap at configurable limits
         max_workers_limit = parallel_config.get("max_workers_limit", 16)
         self.max_concurrent_jobs = max(1, min(self.max_concurrent_jobs, max_workers_limit))
@@ -2690,8 +2962,69 @@ class ParallelVideoProcessor(VideoCompressor):
         self.log(f"   Max concurrent jobs: {self.max_concurrent_jobs} (CPU cores: {cpu_cores})", "INFO")
         self.log(f"   Segment parallel: {'✅ Enabled' if self.segment_parallel else '❌ Disabled'}", "INFO")
     
+    def process_segments_with_generators(self, segments, output_dir, progress_callback=None):
+        """Process segments using Stage 3 generator-based workers for enhanced efficiency."""
+        if not segments:
+            return [], "No segments provided"
+        
+        self.log(f"🔄 GENERATOR-BASED SEGMENT PROCESSING (Stage 3)", "INFO")
+        self.log(f"   Segments to process: {len(segments)}", "INFO")
+        self.log(f"   Generator workers: {self.max_concurrent_jobs}", "INFO")
+        
+        # Prepare segment tasks for generator workers
+        segment_tasks = []
+        for i, segment_path in enumerate(segments):
+            segment_tasks.append({
+                'segment_path': segment_path,
+                'segment_index': i,
+                'total_segments': len(segments),
+                'file_path': Path(segment_path).parent  # For video info lookup
+            })
+        
+        # Use generator manager to process segments
+        try:
+            completed_segments, failed_segments = self.generator_manager.process_segments_with_generators(
+                segment_tasks, progress_callback
+            )
+            
+            if failed_segments:
+                error_msg = f"Generator processing completed with {len(failed_segments)} failures"
+                self.log(f"⚠️ {error_msg}", "WARNING")
+                for failure in failed_segments[:3]:  # Show first 3 failures
+                    self.log(f"   - {Path(failure['segment_path']).name}: {failure['error']}", "ERROR")
+                return completed_segments, error_msg
+            else:
+                success_msg = "All segments processed successfully with generator workers"
+                self.log(f"✅ {success_msg}", "INFO")
+                return completed_segments, success_msg
+                
+        except Exception as e:
+            error_msg = f"Generator segment processing error: {type(e).__name__}: {e}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            # Fall back to traditional ThreadPoolExecutor
+            self.log(f"🔄 Falling back to ThreadPoolExecutor processing", "WARNING")
+            return self.process_segments_parallel_traditional(segments, output_dir, progress_callback)
+        finally:
+            # Clean up generator workers
+            self.generator_manager.shutdown_all()
+    
     def process_segments_parallel(self, segments, output_dir, progress_callback=None):
-        """Process video segments in parallel with comprehensive progress tracking."""
+        """Smart dispatcher: Choose between generator-based or ThreadPoolExecutor processing."""
+        if not segments:
+            return [], "No segments provided"
+        
+        # Intelligent choice between processing methods
+        use_generators = len(segments) > 10 and self.max_concurrent_jobs >= 4  # Use generators for larger jobs
+        
+        if use_generators:
+            self.log(f"🧠 Using generator-based processing for {len(segments)} segments", "INFO")
+            return self.process_segments_with_generators(segments, output_dir, progress_callback)
+        else:
+            self.log(f"🧠 Using ThreadPoolExecutor processing for {len(segments)} segments", "INFO")
+            return self.process_segments_parallel_traditional(segments, output_dir, progress_callback)
+    
+    def process_segments_parallel_traditional(self, segments, output_dir, progress_callback=None):
+        """Traditional ThreadPoolExecutor-based segment processing with comprehensive progress tracking."""
         if not segments:
             return [], "No segments provided"
         
@@ -2828,6 +3161,10 @@ class ParallelVideoProcessor(VideoCompressor):
         # Start parallel processing with ThreadPoolExecutor
         actual_workers = min(self.max_concurrent_jobs, len(segments))
         
+        # Update progress aggregator with thread pool info
+        self.progress_aggregator.set_thread_pool_info(0, actual_workers)
+        self.progress_aggregator.set_queue_info(len(segments), len(segments))
+        
         try:
             with ThreadPoolExecutor(max_workers=actual_workers, thread_name_prefix="SegmentWorker") as executor:
                 # Submit all segment compression jobs
@@ -2837,6 +3174,9 @@ class ParallelVideoProcessor(VideoCompressor):
                 }
                 
                 self.log(f"🚀 Started {len(futures)} parallel segment compression jobs", "INFO")
+                
+                # Update active worker count (all workers are now active)
+                self.progress_aggregator.set_thread_pool_info(len(futures), actual_workers)
                 
                 # Progress tracking variables
                 segment_progress = {i: 0.0 for i in range(len(segments))}
@@ -2858,6 +3198,12 @@ class ParallelVideoProcessor(VideoCompressor):
                         completed_count += 1
                         segment_progress[result['segment_index']] = 1.0
                         
+                        # Update thread pool info with remaining active workers
+                        remaining_segments = len(segments) - completed_count
+                        active_workers = min(remaining_segments, actual_workers)
+                        self.progress_aggregator.set_thread_pool_info(active_workers, actual_workers)
+                        self.progress_aggregator.set_queue_info(remaining_segments, len(segments))
+                        
                         # Get enhanced progress data from aggregator
                         progress_data = self.progress_aggregator.get_aggregate_progress()
                         overall_progress = progress_data['overall_progress']
@@ -2866,10 +3212,11 @@ class ParallelVideoProcessor(VideoCompressor):
                         if current_time - last_log_time > 10.0 or completed_count == len(segments):  # Every 10 seconds or final
                             elapsed = current_time - start_time
                             
-                            # Log detailed parallel worker status
+                            # Log detailed parallel worker status with enhanced queue info
                             self.log(
                                 f"📊 Parallel Progress: {completed_count}/{len(segments)} segments ({overall_progress*100:.1f}%) | "
                                 f"Active Workers: {progress_data['active_workers']}/{progress_data['total_workers']} | "
+                                f"Queue: {progress_data.get('queue_size', remaining_segments)} remaining | "
                                 f"Total Throughput: {progress_data['throughput_mbps']:.1f}MB/s | "
                                 f"ETA: {str(timedelta(seconds=int(progress_data['eta_seconds'])))} | "
                                 f"Elapsed: {str(timedelta(seconds=int(elapsed)))}",

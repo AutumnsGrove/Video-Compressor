@@ -227,6 +227,24 @@ ls -la /tmp/video_compression/
 4. **CHECK RESULTS**: Verify compressed files work correctly
 5. **READ LOGS**: Review processing logs for any issues
 
+## 🤝 Contributing
+
+### NVIDIA GPU Development Wanted!
+
+**Calling all NVIDIA GPU owners!** 
+
+This project currently supports Apple VideoToolbox hardware acceleration but lacks NVIDIA NVENC support. If you have:
+- An NVIDIA graphics card (RTX series preferred)
+- Development experience or willingness to test
+- Time to help improve performance for NVIDIA users
+
+**We'd love your help!** Please:
+1. Open a GitHub issue titled "NVIDIA Development - [Your GPU Model]"
+2. Let us know if you can test code on your machine or provide remote access
+3. Share your system specs (GPU model, drivers, OS)
+
+NVIDIA GPU acceleration could provide 2-5x faster compression speeds, and your contribution would help thousands of users!
+
 ## 🆘 Emergency Recovery
 
 If something goes wrong:

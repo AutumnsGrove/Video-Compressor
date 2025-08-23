@@ -237,30 +237,40 @@ def create_interface():
                     if not isinstance(eta_seconds, (int, float)) or isinstance(eta_seconds, bool):
                         eta_seconds = 0
                     
-                    # Create enhanced status message with segmentation awareness
+                    # Create enhanced status message with Stage 3 improvements
                     workers_info = progress_data.get('workers', [])
                     has_segments = any('segment' in w.get('task_name', '').lower() for w in workers_info)
                     
+                    # Get Stage 3 tracking data
+                    queue_size = progress_data.get('queue_size', 0)
+                    total_queue_size = progress_data.get('total_queue_size', 0)
+                    current_file = progress_data.get('current_file', 0)
+                    total_files = progress_data.get('total_files', 0)
+                    
                     if active_workers > 0:
                         if has_segments:
-                            # Segmentation workflow in progress
+                            # Segmentation workflow in progress with queue info
+                            queue_info = f"Queue: {queue_size} remaining" if queue_size > 0 else "Queue: Processing final segments"
                             if eta_seconds > 0:
                                 eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
-                                status_message = f"Large file segmentation: {active_workers}/{total_workers} segments | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
+                                status_message = f"Large file segmentation: {active_workers}/{total_workers} workers | {queue_info} | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
                             else:
-                                status_message = f"Large file segmentation: {active_workers}/{total_workers} segments | {throughput_mbps:.1f}MB/s"
+                                status_message = f"Large file segmentation: {active_workers}/{total_workers} workers | {queue_info} | {throughput_mbps:.1f}MB/s"
                         else:
-                            # Regular processing
+                            # Regular processing with file progress
+                            file_info = f"File {current_file+1}/{total_files}" if total_files > 0 else "Processing"
                             if eta_seconds > 0:
                                 eta_str = f"{int(eta_seconds//3600):02d}:{int((eta_seconds%3600)//60):02d}:{int(eta_seconds%60):02d}"
-                                status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
+                                status_message = f"{file_info}: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s | ETA: {eta_str}"
                             else:
-                                status_message = f"Processing: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s"
+                                status_message = f"{file_info}: {active_workers}/{total_workers} workers active | {throughput_mbps:.1f}MB/s"
                     else:
                         if has_segments:
-                            status_message = f"Segmentation complete | Total throughput: {throughput_mbps:.1f}MB/s"
+                            completed_segments = total_queue_size - queue_size if total_queue_size > 0 else 0
+                            status_message = f"Segmentation complete: {completed_segments} segments processed | Total throughput: {throughput_mbps:.1f}MB/s"
                         else:
-                            status_message = f"Processing complete | Total throughput: {throughput_mbps:.1f}MB/s"
+                            file_info = f"Completed {current_file}/{total_files} files" if total_files > 0 else "Processing complete"
+                            status_message = f"{file_info} | Total throughput: {throughput_mbps:.1f}MB/s"
                     
                     # Map overall progress to 0.2 -> 0.95 range 
                     mapped_progress = 0.2 + (overall_progress * 0.75)
