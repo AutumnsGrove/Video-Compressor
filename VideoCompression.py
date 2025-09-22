@@ -1468,10 +1468,14 @@ class VideoCompressor:
         if not original_info:
             return False, "Cannot read original video information"
         
+        # Set up progress callback if provided
+        if progress_callback:
+            self.progress_aggregator.set_callback(progress_callback)
+
         # Check if file should be segmented for large file processing
         if self.should_segment_file(input_path):
             return self.compress_video_with_segmentation(input_path, output_path, progress_callback)
-        
+
         # Get video duration for progress calculation
         video_duration = self.get_video_duration(original_info)
         file_size = os.path.getsize(input_path)
@@ -1480,8 +1484,6 @@ class VideoCompressor:
         worker_id = f"single_compress_{int(time.time())}"
         task_name = f"Compressing {Path(input_path).name}"
         self.progress_aggregator.register_worker(worker_id, task_name, file_size)
-        if progress_callback:
-            self.progress_aggregator.set_callback(progress_callback)
         
         # Build ffmpeg command with progress output to stderr
         cmd = self.build_ffmpeg_command(input_path, output_path, original_info)
@@ -1599,14 +1601,16 @@ class VideoCompressor:
                         # Log progress with enhanced info for large files
                         if (current_time - last_log_time > 10.0 or  # Every 10 seconds
                             progress_pct > current_progress + 0.02):  # Or every 2%
-                            
+
+                            # Always calculate elapsed time first
+                            elapsed = current_time - start_time
+
                             time_remaining = "unknown"
                             if progress_pct > 0.01:  # Avoid division by zero
-                                elapsed = current_time - start_time
                                 total_estimated = elapsed / progress_pct
                                 remaining = total_estimated - elapsed
                                 time_remaining = str(timedelta(seconds=int(remaining)))
-                            
+
                             # Calculate throughput
                             throughput_mbps = 0
                             if elapsed > 0 and size_kb > 0:
