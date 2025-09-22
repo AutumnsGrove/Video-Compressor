@@ -1599,14 +1599,16 @@ class VideoCompressor:
                         # Log progress with enhanced info for large files
                         if (current_time - last_log_time > 10.0 or  # Every 10 seconds
                             progress_pct > current_progress + 0.02):  # Or every 2%
-                            
+
+                            # Always calculate elapsed time first
+                            elapsed = current_time - start_time
+
                             time_remaining = "unknown"
                             if progress_pct > 0.01:  # Avoid division by zero
-                                elapsed = current_time - start_time
                                 total_estimated = elapsed / progress_pct
                                 remaining = total_estimated - elapsed
                                 time_remaining = str(timedelta(seconds=int(remaining)))
-                            
+
                             # Calculate throughput
                             throughput_mbps = 0
                             if elapsed > 0 and size_kb > 0:
